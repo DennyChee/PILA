@@ -131,3 +131,54 @@ physics/dpm/
 .vscode/
 .idea/
 __MACOSX/
+
+# Claude Code local (personal) settings — do not commit
+.claude/settings.local.json
+
+# =====================================================================
+# Added for the DennyChee fork: keep code/configs/scripts in git, but
+# exclude large data, reproducible outputs, and personal local state.
+# These already exist on the HPC copy, so a `git pull` there leaves them
+# untouched (pull never deletes untracked files) and both sides stay in
+# sync on the *code*. GitHub also hard-rejects files >100MB.
+# =====================================================================
+
+# --- macOS / editor junk ---
+.DS_Store
+**/.DS_Store
+
+# --- Claude Code local state (backups, logs, personal settings) ---
+.claude/
+
+# --- Protected inputs & trained checkpoints (large; already on HPC) ---
+data/raw/
+data/processed/
+pretrained/
+
+# --- Large reproducible outputs / archives (already on HPC) ---
+_outputs_archive_*/
+classic_out_*/
+classical_rerun/
+comparison_out/
+comparison_out_*/
+exported_ml*/
+experiment_figures/
+pila_pres_figures/
+snr_figures_export/
+uq_aggregated_results/
+uq_jobs*/
+multistart_jobs*/
+definitive_jobs*/
+submit_replot/
+
+# --- Synthetic data & heavy outputs (keep generation code, drop data) ---
+synthetic/cubes/
+synthetic/validation/
+synthetic/eval/
+synthetic/marapi_grid/
+synthetic/figures_moving_source/
+synthetic/snr_sweep/
+synthetic/snr_sweep_ml1/
+synthetic/snr_sweep_ml1_ff/
+synthetic/logs/
+synthetic/__pycache__/

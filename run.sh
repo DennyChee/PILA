@@ -8,7 +8,7 @@ PYTHON="${PYTHON:-python}"
 
 # -------------------- PILA (our method) --------------------
 # Mogi inversion (PILA)
-# $PYTHON train_pila.py --config configs/phys_smpl/PILA_Mogi_C.json
+$PYTHON train_pila.py --config configs/phys_smpl/PILA_Mogi_C.json
 
 # RTM inversion (PILA) - Austria and Wytham datasets
 # $PYTHON train_pila.py --config configs/phys_smpl/PILA_RTM_C_austria.json

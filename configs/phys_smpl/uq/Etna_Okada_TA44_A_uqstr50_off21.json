@@ -1,0 +1,154 @@
+{
+    "name": "Etna_Okada_TA44_A_uqstr50_off21",
+    "n_gpu": 1,
+    "arch": {
+        "type": "PHYS_VAE_SMPL",
+        "args": {
+            "physics": "Okada_LOS",
+            "encoder_type": "mlp",
+            "input_dim": 1000,
+            "hidden_dim": 8,
+            "time_feat_dim": 4,
+            "use_time_in_residual": false,
+            "okada_paras": "configs/okada_dike_paras.json",
+            "insar": {
+                "timeseries": "/eos-rs/INSAR_processing/denny/Etna/S1_TA44/mintpy/geo/geo_timeseries_SET_ERA5_ramp_demErr.h5",
+                "geometry": "/eos-rs/INSAR_processing/denny/Etna/S1_TA44/mintpy/geo/geo_geometryRadar.h5",
+                "mask": "/eos-rs/INSAR_processing/denny/Etna/S1_TA44/mintpy/geo/geo_maskTempCoh.h5",
+                "lat0": 37.751,
+                "lon0": 14.993,
+                "multilook": 1,
+                "coh_valid_frac": 0.5,
+                "verbose": false,
+                "stride": 50,
+                "offset": 21
+            }
+        },
+        "phys_vae": {
+            "no_phy": false,
+            "dim_z_aux": 4,
+            "dim_z_phy": 8,
+            "activation": "elu",
+            "num_units_feat": 128,
+            "hidlayers_feat": [
+                128
+            ],
+            "hidlayers_z_aux": [
+                128
+            ],
+            "hidlayers_z_phy": [
+                128
+            ],
+            "residual_rank": 4,
+            "tau_init": 3.0,
+            "tau_final": 1.0,
+            "tau_warmup_epochs": 20,
+            "r_init": 0.0,
+            "r_final": 1.0,
+            "r_warmup_epochs": 30,
+            "ortho_penalty_weight": 0.1,
+            "coeff_penalty_weight": 0.0,
+            "delta_penalty_weight": 0.0,
+            "detach_x_P_for_bias": true
+        }
+    },
+    "data_loader": {
+        "type": "InSARh5DataLoader",
+        "type_test": "InSARh5DataLoader",
+        "args": {
+            "insar": {
+                "timeseries": "/eos-rs/INSAR_processing/denny/Etna/S1_TA44/mintpy/geo/geo_timeseries_SET_ERA5_ramp_demErr.h5",
+                "geometry": "/eos-rs/INSAR_processing/denny/Etna/S1_TA44/mintpy/geo/geo_geometryRadar.h5",
+                "mask": "/eos-rs/INSAR_processing/denny/Etna/S1_TA44/mintpy/geo/geo_maskTempCoh.h5",
+                "lat0": 37.751,
+                "lon0": 14.993,
+                "multilook": 1,
+                "coh_valid_frac": 0.5,
+                "verbose": false,
+                "stride": 50,
+                "offset": 21
+            },
+            "batch_size": 8,
+            "shuffle": true,
+            "validation_split": 0.0,
+            "num_workers": 0,
+            "with_const": false
+        },
+        "data_dir_valid": {
+            "timeseries": "/eos-rs/INSAR_processing/denny/Etna/S1_TA44/mintpy/geo/geo_timeseries_SET_ERA5_ramp_demErr.h5",
+            "geometry": "/eos-rs/INSAR_processing/denny/Etna/S1_TA44/mintpy/geo/geo_geometryRadar.h5",
+            "mask": "/eos-rs/INSAR_processing/denny/Etna/S1_TA44/mintpy/geo/geo_maskTempCoh.h5",
+            "lat0": 37.751,
+            "lon0": 14.993,
+            "multilook": 1,
+            "coh_valid_frac": 0.5,
+            "verbose": false,
+            "stride": 50,
+            "offset": 21
+        },
+        "data_dir_test": {
+            "timeseries": "/eos-rs/INSAR_processing/denny/Etna/S1_TA44/mintpy/geo/geo_timeseries_SET_ERA5_ramp_demErr.h5",
+            "geometry": "/eos-rs/INSAR_processing/denny/Etna/S1_TA44/mintpy/geo/geo_geometryRadar.h5",
+            "mask": "/eos-rs/INSAR_processing/denny/Etna/S1_TA44/mintpy/geo/geo_maskTempCoh.h5",
+            "lat0": 37.751,
+            "lon0": 14.993,
+            "multilook": 1,
+            "coh_valid_frac": 0.5,
+            "verbose": false,
+            "stride": 50,
+            "offset": 21
+        }
+    },
+    "optimizer": {
+        "type": "Adam",
+        "args": {
+            "lr": 0.0003,
+            "weight_decay": 0.0001,
+            "amsgrad": true
+        }
+    },
+    "loss": "mse_loss",
+    "loss_test": "mse_loss",
+    "metrics": [],
+    "lr_scheduler": {
+        "type": "CosineAnnealingLR",
+        "args": {
+            "T_max": 150
+        }
+    },
+    "trainer": {
+        "epochs": 150,
+        "save_dir": "saved/stride_uq/etna_okada_ta44_a_uqstr50",
+        "save_period": 10,
+        "log_step": 5,
+        "verbosity": 2,
+        "monitor": "min val_rec_loss",
+        "early_stop": 100,
+        "input_key": "displacement",
+        "output_key": "displacement",
+        "stablize_grad": true,
+        "grad_clip_norm": 1.0,
+        "tensorboard": false,
+        "wandb": false,
+        "phys_vae": {
+            "epochs_pretrain": 0,
+            "kl_warmup_epochs": 50,
+            "balance_gate": 0.001,
+            "balance_data_aug": 1.0,
+            "balance_residual": 0.001,
+            "use_kl_term_z_phy": false,
+            "beta_max_z_phy": 1.0,
+            "use_kl_term_z_aux": false,
+            "beta_max_z_aux": 1.0,
+            "use_capacity_control": false,
+            "C_max": 7.0,
+            "C_gamma": 10.0,
+            "beta_aux": 1.0,
+            "edge_penalty_weight": 0.0,
+            "edge_penalty_power": 1.0,
+            "temporal_smoothness_weight": 0.0,
+            "use_ema_prior": false,
+            "ema_momentum": 0.999
+        }
+    }
+}

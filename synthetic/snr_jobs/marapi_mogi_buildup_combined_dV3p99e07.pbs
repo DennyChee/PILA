@@ -1,0 +1,19 @@
+#!/bin/bash
+#PBS -N snrp60
+#PBS -P eos_btaisne
+#PBS -q qintel_wfly
+#PBS -l nodes=1:ppn=8
+#PBS -l walltime=01:00:00
+#PBS -l mem=8gb
+#PBS -j oe
+#PBS -o synthetic/snr_jobs/logs/marapi_mogi_buildup_combined_dV3p99e07.log
+cd "$PBS_O_WORKDIR"
+source /eos-rs/miniconda3/etc/profile.d/conda.sh
+conda activate pila
+export PYTHONPATH="${PYTHONPATH}:$PBS_O_WORKDIR"
+export MKL_THREADING_LAYER=GNU
+echo "[marapi_mogi_buildup_combined_dV3p99e07] host $(hostname) start $(date)  target SNR +6.0 dB  dV 3.991e+07"
+python -m synthetic.run_one_snr_point \
+    --base-spec synthetic/specs/marapi_mogi_buildup_combined.json --template configs/phys_smpl/SierraNegra_Mogi_InSAR_A.json \
+    --dv 3.990525e+07 --multilook 1 --epochs 120 --out synthetic/snr_sweep_ml1
+echo "[marapi_mogi_buildup_combined_dV3p99e07] done $(date)"

@@ -1,0 +1,19 @@
+{
+  "name": "sierranegra_sun69_moving_clean",
+  "model": "sun69",
+  "base_scene": {
+    "timeseries": "/eos-rs/INSAR_processing/denny/SierraNegra/S1_TD128/mintpy/geo/geo_timeseries_SET_ERA5_demErr.h5",
+    "geometry": "/eos-rs/INSAR_processing/denny/SierraNegra/S1_TD128/mintpy/geo/geo_geometryRadar.h5",
+    "mask": "/eos-rs/INSAR_processing/denny/SierraNegra/S1_TD128/mintpy/geo/geo_maskTempCoh.h5",
+    "lat0": -0.83,
+    "lon0": -91.17
+  },
+  "trajectory": {
+    "type": "moving",
+    "profile": "linear",
+    "start": { "xcen": -2500.0, "ycen": -2000.0, "depth": 3000.0, "radius": 1500.0, "dV": 2.0e7 },
+    "end":   { "xcen":  2500.0, "ycen":  2000.0, "depth": 4500.0, "radius": 1500.0, "dV": 1.0e8 }
+  },
+  "noise": { "type": "none" },
+  "paras": "configs/sierranegra_sun69_paras.json"
+}

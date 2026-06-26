@@ -1,0 +1,32 @@
+#!/bin/bash
+# Usage:       qsub submit_krasheninnikov_sun69_ta140_a.pbs
+# Description: Submit the PILA Krasheninnikov Sun69 InSAR (Stage A, MLP) training job to PBS,
+#              track TA140. Trains the physics-VAE on the whole MintPy LOS time
+#              series (each epoch an independent sample) to invert for the Sun69 source.
+# Date:        2026-06-17
+#PBS -N KR_Sun69_TA140
+#PBS -P eos_btaisne
+#PBS -q qintel_wfly
+#PBS -l nodes=1:ppn=8
+#PBS -l walltime=12:00:00
+#PBS -l mem=16gb
+#PBS -j oe
+#PBS -o logs/KR_Sun69_TA140_pbs.log
+
+# --- Move to the directory the job was submitted from (the PILA repo root) ---
+cd "$PBS_O_WORKDIR"
+
+# --- Activate the PILA conda environment (torch 2.0.0, CPU-only on this node) ---
+source /eos-rs/miniconda3/etc/profile.d/conda.sh
+conda activate pila
+
+# --- Make the repo importable (data_loader, model, datasets, ... are top-level pkgs) ---
+export PYTHONPATH="${PYTHONPATH}:$PBS_O_WORKDIR"
+
+echo "[KR_Sun69_TA140] Host: $(hostname)  Env: $CONDA_DEFAULT_ENV  Workdir: $PBS_O_WORKDIR"
+echo "[KR_Sun69_TA140] Starting training at $(date)"
+
+# --- Train Sun69 InSAR A (whole-timeseries, epochs independent) ---
+python train_pila.py --config configs/phys_smpl/Krasheninnikov_Sun69_TA140_A.json
+
+echo "[KR_Sun69_TA140] Finished at $(date)"

@@ -1,6 +1,12 @@
 # Training script for PILA (our method)
 import argparse
 import collections
+import json
+import os
+import resource
+import subprocess
+import sys
+import time
 import torch
 import numpy as np
 import data_loader.data_loaders as module_data
@@ -12,20 +18,167 @@ from trainer import PhysVAETrainerSMPL  # PILA trainer
 from utils import prepare_device
 import wandb
 
-# Fix random seeds for reproducibility
+# Fix random seeds for reproducibility. SEED is the historical default (123); it can be
+# overridden per run via the config key "seed" or the CLI flag --seed (see main()), which
+# is how multi-start ensembles escape null-source local minima on noisy real scenes.
 SEED = 123
-torch.manual_seed(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-np.random.seed(SEED)
+
+
+def set_seed(seed):
+    """Set torch + numpy RNG seeds (deterministic cuDNN) for a reproducible run."""
+    torch.manual_seed(int(seed))
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    np.random.seed(int(seed))
+
+
+set_seed(SEED)  # default; main() re-seeds from config['seed'] if provided
+
+
+def log_compute_usage(config, logger, data_loader, model, device, data_load_sec, train_sec):
+    """
+    Record compute/scalability stats for the run and write them to compute_usage.json.
+
+    Captures the problem size (observation points/grid cells, time-series samples), the
+    MintPy load+multilook time, the training time and throughput, and peak memory — so
+    runs of different scene sizes / multilook factors can be compared for scalability.
+    """
+    args = config['arch']['args']
+    n_train_epochs = config['trainer']['epochs']
+    n_samples = len(data_loader.dataset)
+    usage = {
+        'device': str(device),
+        'physics': args.get('physics'),
+        'encoder_type': args.get('encoder_type', 'mlp'),
+        'n_obs_points': args.get('input_dim'),     # LOS cells (MLP) or grid cells (CNN)
+        'n_samples_epochs': n_samples,             # time-series epochs used as samples
+        'n_train_epochs': n_train_epochs,
+        'batch_size': config['data_loader']['args'].get('batch_size'),
+        'model_params': int(sum(p.numel() for p in model.parameters())),
+        'data_load_sec': round(data_load_sec, 2),  # MintPy read + multilook (+model build)
+        'train_sec': round(train_sec, 2),
+        'sec_per_train_epoch': round(train_sec / max(n_train_epochs, 1), 3),
+        'samples_per_sec': round(n_samples * n_train_epochs / max(train_sec, 1e-9), 1),
+        'peak_rss_mb': round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 1),
+        'gpu_peak_mb': round(torch.cuda.max_memory_allocated() / 1e6, 1) if torch.cuda.is_available() else 0.0,
+    }
+    # InSAR multilook geometry (memoized loader -> instant) for the scene/grid context.
+    ins = args.get('insar')
+    if ins is not None:
+        try:
+            from datasets.preprocessing.insar_mintpy import load_insar_mintpy
+            d = load_insar_mintpy(
+                ins['timeseries'], ins['geometry'], ins.get('mask'),
+                ins['lat0'], ins['lon0'], multilook=ins.get('multilook', 20),
+                coh_valid_frac=ins.get('coh_valid_frac', 0.5), bbox=ins.get('bbox'),
+                verbose=False)
+            usage.update({'multilook': ins.get('multilook', 20),
+                          'coarse_grid': list(d.mask_d.shape),
+                          'coherent_cells': int(d.mask_d.sum()),
+                          'bbox': ins.get('bbox')})
+        except Exception as exc:  # telemetry must never crash training
+            logger.warning(f"compute-usage: could not read InSAR geometry: {exc}")
+
+    out_path = os.path.join(str(config.save_dir), 'compute_usage.json')
+    with open(out_path, 'w') as f:
+        json.dump(usage, f, indent=2)
+    logger.info("=== Compute usage (scalability) ===")
+    for key, val in usage.items():
+        logger.info(f"  {key}: {val}")
+    logger.info(f"  written to {out_path}")
+
+
+def generate_insar_figures(config, logger):
+    """
+    End-of-run verification figures for InSAR inversions: observed LOS, model fit,
+    and residual maps + a 1:1 scatter, for visual inspection.
+
+    Delegates to the standalone plot_insar_results.py (the tested MLP/point LOS
+    plotting path) as an isolated subprocess so a plotting failure can never fail
+    an otherwise-completed training run. Only applies to the h5-native InSAR LOS
+    MLP path (physics '*_LOS', encoder_type != 'cnn', with an 'insar' block); the
+    CNN/image path is skipped (different I/O) and GPS configs have no insar field.
+    """
+    args = config['arch']['args']
+    physics = args.get('physics', '')
+    encoder_type = args.get('encoder_type', 'mlp')
+    if not (physics.endswith('_LOS') and encoder_type != 'cnn' and 'insar' in args):
+        logger.info(f"Skipping auto figures (physics={physics}, encoder_type={encoder_type}): "
+                    f"plot_insar_results.py only supports the InSAR LOS MLP path.")
+        return
+
+    # config.save_dir is the run's models/ dir; model_best.pth is written there.
+    resume_path = os.path.join(str(config.save_dir), 'model_best.pth')
+    if not os.path.exists(resume_path):
+        logger.warning(f"Auto figures: model_best.pth not found at {resume_path}; skipping.")
+        return
+
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'plot_insar_results.py')
+    cmd = [sys.executable, script, '--resume', resume_path]
+    logger.info(f"Generating verification figures: {' '.join(cmd)}")
+    try:
+        # Plotting must never crash a finished run; capture and log on failure only.
+        subprocess.run(cmd, check=True, cwd=os.path.dirname(script))
+        figures_dir = os.path.join(os.path.dirname(str(config.save_dir)), 'figures')
+        logger.info(f"Verification figures written to {figures_dir}")
+    except subprocess.CalledProcessError as exc:
+        logger.warning(f"Auto figure generation failed (exit {exc.returncode}); "
+                       f"run plot_insar_results.py -r {resume_path} manually.")
+
+
+def _propagate_insar_uq(cfg):
+    """
+    Mirror the UQ/decimation keys (multilook, stride, offset) from the canonical
+    arch.args.insar block into every OTHER insar block in the config (the data_loader
+    train block and the valid/test data_dir blocks). PILA derives points from each block
+    independently via the memoized loader, so all blocks MUST carry identical
+    multilook/stride/offset or the dataset and decoder would invert different subsets.
+
+    Mutates `cfg` (a plain dict) in place. No-op when there is no arch.args.insar block
+    (e.g. GNSS runs) or when none of the keys are set.
+    """
+    arch_ins = cfg.get('arch', {}).get('args', {}).get('insar')
+    if not arch_ins:
+        return
+    uq_keys = {k: arch_ins[k] for k in
+               ('multilook', 'stride', 'offset',
+                'bootstrap_k', 'bootstrap_block', 'bootstrap_seed') if k in arch_ins}
+    if not uq_keys:
+        return
+    dl = cfg.get('data_loader', {})
+    # Two block shapes exist: data_loader.args wraps the insar dict under an 'insar' key,
+    # whereas data_dir_valid / data_dir_test ARE the insar dict directly (they hold
+    # 'timeseries'/'geometry' at top level and are passed as the loader's `insar` arg).
+    candidates = [dl.get('args', {}), dl.get('data_dir_valid', {}), dl.get('data_dir_test', {})]
+    for block in candidates:
+        if not isinstance(block, dict):
+            continue
+        if isinstance(block.get('insar'), dict):       # wrapped: ...args.insar
+            block['insar'].update(uq_keys)
+        elif 'timeseries' in block:                    # bare insar dict (valid/test)
+            block.update(uq_keys)
 
 
 def main(config):
     logger = config.get_logger('train')
 
-    # Setup data_loader instances
+    # Re-seed from the config (set via --seed / config key "seed"); default = SEED (123).
+    # The module-level set_seed(SEED) above ran at import with the default; this lets a
+    # multi-start ensemble vary the RNG init per run to escape null-source local minima.
+    run_seed = config.config.get('seed', SEED)
+    set_seed(run_seed)
+    logger.info(f"RNG seed = {run_seed}")
+
+    # Keep all insar blocks consistent before any loader/model reads them (UQ decimation).
+    _propagate_insar_uq(config.config)
+    ins_dbg = config.config.get('arch', {}).get('args', {}).get('insar', {})
+    print(f"  InSAR UQ config: multilook={ins_dbg.get('multilook', 1)}, "
+          f"stride={ins_dbg.get('stride', 1)}, offset={ins_dbg.get('offset', 0)}")
+
+    # Setup data_loader instances (time the MintPy read + multilook for h5 datasets)
+    t_data0 = time.time()
     data_loader = config.init_obj('data_loader', module_data)
-    
+
     valid_data_loader = getattr(module_data, config['data_loader']['type'])(
         config['data_loader']['data_dir_valid'],
         batch_size=64,
@@ -35,7 +188,9 @@ def main(config):
         with_const=config['data_loader']['args']['with_const'] if 'with_const' in config['data_loader']['args'] else False
     )
 
-    # Build model architecture and log 
+    data_load_sec = time.time() - t_data0
+
+    # Build model architecture and log
     model = PHYS_VAE_SMPL(config)
     logger.info(model)
 
@@ -68,7 +223,15 @@ def main(config):
         lr_scheduler=lr_scheduler
     )
 
+    t_train0 = time.time()
     trainer.train()
+    train_sec = time.time() - t_train0
+
+    # Record compute/scalability usage for this run.
+    log_compute_usage(config, logger, data_loader, model, device, data_load_sec, train_sec)
+
+    # Generate observed / model-fit / residual figures for visual inspection.
+    generate_insar_figures(config, logger)
 
 
 if __name__ == '__main__':
@@ -148,6 +311,20 @@ if __name__ == '__main__':
                    target='trainer;phys_vae;temporal_smoothness_weight'),
         CustomArgs(['--loss'], type=str,
                    target='loss'),
+        # UQ strided-decimation ensemble: multilook (default 1 = full res), stride n, and
+        # this member's phase offset. These set the CANONICAL arch.args.insar block;
+        # _propagate_insar_uq() then mirrors them into the data_loader / valid / test
+        # insar blocks so every path inverts the SAME point subset.
+        CustomArgs(['--multilook'], type=int,
+                   target='arch;args;insar;multilook'),
+        CustomArgs(['--stride'], type=int,
+                   target='arch;args;insar;stride'),
+        CustomArgs(['--offset'], type=int,
+                   target='arch;args;insar;offset'),
+        # Multi-start: override the RNG seed (top-level config key) so the same scene can be
+        # re-fit from several inits; keep the best-reconstruction-loss run to escape
+        # null-source local minima on noisy real data.
+        CustomArgs(['--seed'], type=int, target='seed'),
     ]
     config = ConfigParser.from_args(args, options)
     

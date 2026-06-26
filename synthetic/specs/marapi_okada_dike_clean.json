@@ -1,0 +1,42 @@
+{
+  "name": "marapi_okada_dike_clean",
+  "model": "okada",
+  "base_scene": {
+    "timeseries": "synthetic/marapi_grid/base_timeseries.h5",
+    "geometry": "synthetic/marapi_grid/geo_geometryRadar.h5",
+    "mask": "synthetic/marapi_grid/geo_maskTempCoh.h5",
+    "lat0": -0.38,
+    "lon0": 100.47
+  },
+  "trajectory": {
+    "type": "moving",
+    "profiles": {
+      "default": "linear",
+      "opening": "sigmoid"
+    },
+    "start": {
+      "xoff": 353.6,
+      "yoff": 353.6,
+      "depth": 2000.0,
+      "strike": 45.0,
+      "dip": 85.0,
+      "length": 1000.0,
+      "width": 3000.0,
+      "opening": 0.1
+    },
+    "end": {
+      "xoff": 4596.2,
+      "yoff": 4596.2,
+      "depth": 2000.0,
+      "strike": 45.0,
+      "dip": 85.0,
+      "length": 13000.0,
+      "width": 3000.0,
+      "opening": 1.5
+    }
+  },
+  "noise": {
+    "type": "none"
+  },
+  "paras": "configs/sierranegra_okada_paras.json"
+}

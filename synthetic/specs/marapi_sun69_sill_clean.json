@@ -1,0 +1,36 @@
+{
+  "name": "marapi_sun69_sill_clean",
+  "model": "sun69",
+  "base_scene": {
+    "timeseries": "synthetic/marapi_grid/base_timeseries.h5",
+    "geometry": "synthetic/marapi_grid/geo_geometryRadar.h5",
+    "mask": "synthetic/marapi_grid/geo_maskTempCoh.h5",
+    "lat0": -0.38,
+    "lon0": 100.47
+  },
+  "trajectory": {
+    "type": "moving",
+    "profiles": {
+      "default": "linear",
+      "dV": "sigmoid"
+    },
+    "start": {
+      "xcen": -7000.0,
+      "ycen": -4000.0,
+      "depth": 3500.0,
+      "radius": 800.0,
+      "dV": 1000000.0
+    },
+    "end": {
+      "xcen": 7000.0,
+      "ycen": 4000.0,
+      "depth": 3500.0,
+      "radius": 3500.0,
+      "dV": 100000000.0
+    }
+  },
+  "noise": {
+    "type": "none"
+  },
+  "paras": "configs/sierranegra_sun69_paras.json"
+}

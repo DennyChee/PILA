@@ -1,0 +1,21 @@
+{
+  "name": "marapi_mogi_buildup_combined",
+  "model": "mogi",
+  "base_scene": {
+    "timeseries": "synthetic/marapi_grid/base_timeseries.h5",
+    "geometry": "synthetic/marapi_grid/geo_geometryRadar.h5",
+    "mask": "synthetic/marapi_grid/geo_maskTempCoh.h5",
+    "lat0": -0.38,
+    "lon0": 100.47
+  },
+  "trajectory": {
+    "type": "static_buildup",
+    "profile": "sigmoid",
+    "geometry": { "xcen": -13438.0, "ycen": 6208.0, "d": 3000.0 },
+    "amplitude_key": "dV",
+    "amp_start": 0.0,
+    "amp_end": 8.0e7
+  },
+  "noise": { "type": "marapi", "components": ["combined"], "reference_epoch0": true },
+  "paras": "configs/sierranegra_mogi_paras.json"
+}

@@ -71,11 +71,28 @@ class PhysVAETrainerSMPL(BaseTrainer):
         self.edge_penalty_weight = config['trainer']['phys_vae'].get('edge_penalty_weight', 0.0)
         self.edge_penalty_power = config['trainer']['phys_vae'].get('edge_penalty_power', 1.0)
         
-        # NEW: Temporal smoothness regularization for Mogi source parameters
+        # NEW: Temporal smoothness regularization for the source geometry params.
         self.temporal_smoothness_weight = config['trainer']['phys_vae'].get('temporal_smoothness_weight', 0.0)
+        # Which leading z_phy dims are the "location/geometry" params to keep
+        # temporally smooth (amplitude is intentionally left free to vary).
+        #   Mogi  : [:3] = xcen, ycen, d            (dV free)
+        #   Okada : [:7] = xoff,yoff,depth,strike,dip,length,width  (opening free)
+        physics = config['arch']['args'].get('physics', 'Mogi')
+        if physics in ('Okada', 'Okada_LOS'):
+            self.temporal_smoothness_dims = 7
+        else:  # Mogi / Mogi_LOS (and any other point-source style decoder)
+            self.temporal_smoothness_dims = 3
+        # Never request more dims than exist.
+        self.temporal_smoothness_dims = min(self.temporal_smoothness_dims, self.dim_z_phy)
         
         # NEW: EMA prior configuration
         self.use_ema_prior = config['trainer']['phys_vae'].get('use_ema_prior', False)
+
+        # NEW: Iterative refinement encoder (default disabled -> original single-pass behaviour)
+        iter_cfg = config['arch']['phys_vae'].get('iterative_refinement', {})
+        self.use_iterative = iter_cfg.get('enabled', False)
+        # Weight on the per-pass (physics-only) reconstruction loss accumulated across passes.
+        self.iter_loss_weight = iter_cfg.get('iter_loss_weight', 1.0)
 
         # NEW: gradient clipping
         self.grad_clip_norm = config['trainer'].get('grad_clip_norm', 1.0)
@@ -105,6 +122,8 @@ class PhysVAETrainerSMPL(BaseTrainer):
             # NEW: EMA prior metrics
             'ema_prior_mean_norm',  # L2 norm of EMA prior mean
             'ema_prior_std_mean',  # Mean of EMA prior standard deviations
+            # NEW: Iterative refinement
+            'iter_loss',  # mean per-pass physics reconstruction loss
             *[m.__name__ for m in metric_ftns], writer=self.writer)
         self.valid_metrics = MetricTracker('rec_loss', 'kl_loss', 'residual_loss', 'residual_rel_diff', *[m.__name__ for m in metric_ftns], writer=self.writer)
 
@@ -167,6 +186,12 @@ class PhysVAETrainerSMPL(BaseTrainer):
                 if time_feats.dim() == 3:  # For sequence data
                     time_feats = time_feats.view(-1, time_feats.size(-1))
 
+            # Full-field CNN path: data is a [B, C, H, W] image with a coherence 'mask'.
+            rec_mask = data_dict.get('mask', None)
+            if rec_mask is not None:
+                rec_mask = rec_mask.to(self.device)
+            is_image = (data.dim() == 4)
+
             if data.dim() == 3:
                 # Sequence format: (batch_size, seq_len, features)
                 sequence_len = data.size(1)
@@ -174,8 +199,17 @@ class PhysVAETrainerSMPL(BaseTrainer):
 
             self.optimizer.zero_grad()
 
-            # Encode (u-space stats) with optional time features
-            z_phy_stat, z_aux_stat = self.model.encode(data, time_feats)
+            # Encode (u-space stats) with optional time features.
+            # Iterative refinement: run K passes and keep every pass's stats for the per-pass
+            # reconstruction loss; the final pass feeds the usual draw/decode/KL path below.
+            # During pretraining the loss is purely the synthetic bootstrap, so the iterative
+            # multi-pass encode would just waste K-1 forward passes -> use a single pass then.
+            if self.use_iterative and not self.no_phy and epoch >= self.epochs_pretrain:
+                all_z_phy_stats, z_aux_stat = self.model.encode_iterative(data, time_feats)
+                z_phy_stat = all_z_phy_stats[-1]
+            else:
+                all_z_phy_stats = None
+                z_phy_stat, z_aux_stat = self.model.encode(data, time_feats)
 
             # NEW: Update EMA prior statistics (if enabled) - only after pretraining phase
             if self.use_ema_prior and not self.no_phy and epoch > 1 + self.epochs_pretrain:
@@ -189,8 +223,41 @@ class PhysVAETrainerSMPL(BaseTrainer):
             x_PB, x_P, y, delta, c = self.model.decode(z_phy, z_aux, epoch=epoch, epochs_pretrain=self.epochs_pretrain, full=True, const=input_const)
 
             # Losses - Get separate KL terms for flexible combination
-            rec_loss, kl_u_phy, kl_z_aux = self._vae_loss(data, z_phy_stat, z_aux_stat, x_PB)
-            
+            # For the CNN image path, flatten the target image (row-major over H,W to match
+            # the grid physics decoder's cell order) and mask incoherent cells in the loss.
+            if is_image:
+                rec_target = data.reshape(data.size(0), -1)
+                rec_mask_flat = rec_mask.reshape(rec_mask.size(0), -1) if rec_mask is not None else None
+            else:
+                rec_target, rec_mask_flat = data, None
+            rec_loss, kl_u_phy, kl_z_aux = self._vae_loss(rec_target, z_phy_stat, z_aux_stat, x_PB, mask=rec_mask_flat)
+
+            # NEW: Iterative refinement per-pass reconstruction loss.
+            # Supervise only the INTERMEDIATE passes (0 .. K-2) with a physics-only
+            # reconstruction (decode through the physics model, no residual correction).
+            # The FINAL pass (K-1) is deliberately excluded here because it is already scored
+            # by the full-ELBO rec_loss above (physics + low-rank residual); supervising it
+            # physics-only too would double-count it and pit the physics fit against the
+            # residual that is meant to absorb model incompleteness. Linearly increasing
+            # weight w_k = (k+1)/K nudges later passes to fit better than earlier ones.
+            # z_phy_k uses the deterministic posterior mean (MAP) as the refinement target,
+            # which matches the hard_z_phy=True default of the standard (KL-off) configs.
+            iter_loss = torch.tensor(0.0, device=data.device)
+            if all_z_phy_stats is not None and epoch >= self.epochs_pretrain:
+                K = len(all_z_phy_stats)
+                num_inter = K - 1  # intermediate passes only
+                for k in range(num_inter):
+                    z_phy_k = torch.sigmoid(all_z_phy_stats[k]['mean'])           # u-space -> (0,1)
+                    x_P_k = self.model.physics_model(z_phy_k, const=input_const)  # physics-only render
+                    if rec_mask_flat is not None:
+                        sq_err_k = (x_P_k - rec_target).pow(2) * rec_mask_flat
+                        rec_k = sq_err_k.sum() / rec_mask_flat.sum().clamp(min=1.0)
+                    else:
+                        rec_k = self.criterion(x_P_k, rec_target)
+                    iter_loss = iter_loss + ((k + 1) / K) * rec_k
+                if num_inter > 0:
+                    iter_loss = iter_loss / num_inter
+
             # Calculate weighted KL loss
             kl_loss = beta_z_phy * kl_u_phy + beta_z_aux * kl_z_aux
             
@@ -256,17 +323,19 @@ class PhysVAETrainerSMPL(BaseTrainer):
                             + self.coeff_penalty_weight * coeff_penalty
                             + self.delta_penalty_weight * delta_penalty
                             + self.edge_penalty_weight * edge_penalty
-                            + self.temporal_smoothness_weight * temporal_smoothness)
+                            + self.temporal_smoothness_weight * temporal_smoothness
+                            + self.iter_loss_weight * iter_loss)
                 else:
                     # --- ORIGINAL MODE ---
                     # Original loss function with combined KL loss
-                    loss = (rec_loss + 
+                    loss = (rec_loss +
                            kl_loss +
                            self.ortho_penalty_weight * ortho_penalty +
                            self.coeff_penalty_weight * coeff_penalty +
                            self.delta_penalty_weight * delta_penalty +
                            self.edge_penalty_weight * edge_penalty +
-                           self.temporal_smoothness_weight * temporal_smoothness)
+                           self.temporal_smoothness_weight * temporal_smoothness +
+                           self.iter_loss_weight * iter_loss)
                     
                     # Initialize capacity control variables for metrics (when not using capacity control)
                     C_t = 0.0
@@ -303,7 +372,10 @@ class PhysVAETrainerSMPL(BaseTrainer):
             
             # NEW: Track temporal smoothness
             self.train_metrics.update('temporal_smoothness', temporal_smoothness.item())
-            
+
+            # NEW: Track iterative-refinement per-pass reconstruction loss
+            self.train_metrics.update('iter_loss', iter_loss.item())
+
             # NEW: Track EMA prior metrics (only after pretraining phase when EMA starts updating)
             if self.use_ema_prior and not self.no_phy and hasattr(self.model, 'ema_mean') and epoch > 1 + self.epochs_pretrain:
                 ema_mean_norm = torch.norm(self.model.ema_mean).item()
@@ -519,21 +591,36 @@ class PhysVAETrainerSMPL(BaseTrainer):
                         if time_feats.dim() == 3:  # For sequence data
                             time_feats = time_feats.view(-1, time_feats.size(-1))
                     
+                    rec_mask = data_dict.get('mask', None)
+                    if rec_mask is not None:
+                        rec_mask = rec_mask.to(self.device)
+                    is_image = (data.dim() == 4)
+
                     if data.dim() == 3:
                         # Sequence format: (batch_size, seq_len, features)
                         sequence_len = data.size(1)
                         data = data.view(-1, data.size(-1))
 
-                    # Get full model output to compute residual_loss
-                    z_phy_stat, z_aux_stat = self.model.encode(data, time_feats)
                     # Use same hard_z settings as training
                     hard_z_phy = not self.use_kl_term_z_phy  # Use deterministic sampling when KL term is disabled
                     hard_z_aux = not self.use_kl_term_z_aux  # Use deterministic sampling when KL term is disabled
-                    z_phy, z_aux = self.model.draw(z_phy_stat, z_aux_stat, hard_z_phy=hard_z_phy, hard_z_aux=hard_z_aux)
+                    # Get full model output to compute residual_loss.
+                    # Iterative refinement: run passes to convergence (matches inference behaviour).
+                    if self.use_iterative and not self.no_phy:
+                        z_phy_stat, z_aux_stat, z_phy, z_aux = self.model.encode_iterative_infer(
+                            data, time_feats, hard_z_phy=hard_z_phy, hard_z_aux=hard_z_aux)
+                    else:
+                        z_phy_stat, z_aux_stat = self.model.encode(data, time_feats)
+                        z_phy, z_aux = self.model.draw(z_phy_stat, z_aux_stat, hard_z_phy=hard_z_phy, hard_z_aux=hard_z_aux)
                     x_PB, x_P, y, delta, c = self.model.decode(z_phy, z_aux, epoch=epoch, epochs_pretrain=self.epochs_pretrain, full=True, const=input_const)
                     
                     # Use unified VAE loss function (same as training)
-                    rec_loss, kl_u_phy, kl_z_aux = self._vae_loss(data, z_phy_stat, z_aux_stat, x_PB)
+                    if is_image:
+                        rec_target = data.reshape(data.size(0), -1)
+                        rec_mask_flat = rec_mask.reshape(rec_mask.size(0), -1) if rec_mask is not None else None
+                    else:
+                        rec_target, rec_mask_flat = data, None
+                    rec_loss, kl_u_phy, kl_z_aux = self._vae_loss(rec_target, z_phy_stat, z_aux_stat, x_PB, mask=rec_mask_flat)
                     kl_loss = kl_u_phy + kl_z_aux # Original behavior: combine first, then average
                     
                     # Compute residual_loss for validation (L2 difference)
@@ -564,14 +651,21 @@ class PhysVAETrainerSMPL(BaseTrainer):
         self.logger.info(f"Validation Epoch: {epoch} Rec Loss: {avg_rec_loss:.6f} KL Loss: {avg_kl_loss:.6f} Residual: {avg_residual_loss:.6f} residual_rel_diff: {avg_residual_rel_diff:.2f}% (Physics vs Corrected)")
         return self.valid_metrics.result()
 
-    def _vae_loss(self, data, z_phy_stat, z_aux_stat, x, pretrain=False):
+    def _vae_loss(self, data, z_phy_stat, z_aux_stat, x, pretrain=False, mask=None):
         """
         VAE loss function that returns separate KL terms for flexible combination.
         Returns: rec_loss, kl_u_phy, kl_z_aux (separate terms for both modes)
+
+        mask : optional [B, D] (1=valid, 0=incoherent). When given (CNN full-field path),
+               reconstruction is masked-MSE over valid cells only, so incoherent pixels do
+               not contribute. When None, the configured criterion is used (point/GPS path).
         """
-        # Use the configured loss function for reconstruction loss
-        # rec_loss = torch.sum((x - data).pow(2), dim=1).mean()
-        rec_loss = self.criterion(x, data)
+        if mask is not None:
+            sq_err = (x - data).pow(2) * mask
+            rec_loss = sq_err.sum() / mask.sum().clamp(min=1.0)
+        else:
+            # Use the configured loss function for reconstruction loss
+            rec_loss = self.criterion(x, data)
 
         n = data.shape[0]
         prior_u_phy_stat, prior_z_aux_stat = self.model.priors(n, self.device)
@@ -613,9 +707,26 @@ class PhysVAETrainerSMPL(BaseTrainer):
                 z = torch.rand((batch_size, self.dim_z_phy), device=self.device).clamp(1e-4, 1-1e-4)
                 synthetic_y = self.model.generate_physonly(z)  # physics-only
             self.model.train()
+            target_u = torch.log(z) - torch.log1p(-z)  # logit(z)
+
+            if self.use_iterative:
+                # Mirror the iterative encoder during pretraining: refine the u-estimate over
+                # K passes, matching each pass to logit(z) with linearly increasing weight.
+                # No init jitter here (unlike encode_iterative's training path) -- pretraining
+                # is the deterministic bootstrap that establishes a clean inverse mapping.
+                K = self.model.num_passes_train
+                u_phy_est = torch.zeros(batch_size, self.dim_z_phy, device=self.device, dtype=synthetic_y.dtype)
+                total_loss = torch.tensor(0.0, device=self.device)
+                for k in range(K):
+                    synthetic_features = self.model.enc.func_feat(synthetic_y, u_phy_est=u_phy_est)
+                    inferred_u_phy = self.model.enc.func_z_phy_mean(synthetic_features)
+                    pass_loss = torch.sum((inferred_u_phy - target_u).pow(2), dim=1).mean()
+                    total_loss = total_loss + ((k + 1) / K) * pass_loss
+                    u_phy_est = inferred_u_phy.detach().clamp(-10.0, 10.0)  # detach + clamp between passes
+                return total_loss / K
+
             synthetic_features = self.model.enc.func_feat(synthetic_y)
             inferred_u_phy = self.model.enc.func_z_phy_mean(synthetic_features)  # u-mean
-            target_u = torch.log(z) - torch.log1p(-z)  # logit(z)
             return torch.sum((inferred_u_phy - target_u).pow(2), dim=1).mean()
         else:
             return torch.zeros(1, device=self.device)
@@ -669,35 +780,39 @@ class PhysVAETrainerSMPL(BaseTrainer):
 
     def _temporal_smoothness_loss(self, z_phy, sequence_len):
         """
-        Temporal smoothness regularization for Mogi source parameters.
-        Encourages minimal variance in the spatial coordinates (xcen, ycen, d) 
-        within each temporal sequence to enforce temporal smoothness.
-        
+        Temporal smoothness regularization for the source location/geometry params.
+        Encourages minimal variance in the leading geometry dimensions within each
+        temporal sequence, while leaving the amplitude dimension free to vary.
+
+        The number of smoothed dimensions is set in __init__ by physics type:
+            Mogi  -> 3 (xcen, ycen, d;            dV free)
+            Okada -> 7 (xoff,yoff,depth,strike,dip,length,width; opening free)
+
         Args:
             z_phy: Physical variables tensor of shape (batch_size * seq_len, dim_z_phy)
             sequence_len: Length of temporal sequences (None if not using sequences)
-            
+
         Returns:
-            Temporal smoothness penalty: variance of spatial coordinates within sequences
+            Temporal smoothness penalty: variance of geometry coordinates within sequences
         """
         if self.no_phy or z_phy is None or sequence_len is None:
             return torch.tensor(0.0, device=self.device)
-        
+
         # Reshape z_phy back to sequence format: (batch_size, seq_len, dim_z_phy)
         batch_size = z_phy.size(0) // sequence_len
         if batch_size * sequence_len != z_phy.size(0):
             # If not evenly divisible, we can't apply temporal smoothness
             return torch.tensor(0.0, device=self.device)
-        
+
         z_phy_seq = z_phy.view(batch_size, sequence_len, -1)  # (batch_size, seq_len, dim_z_phy)
-        
-        # For Mogi model, dim_z_phy=4: [xcen, ycen, d, dV]
-        # We apply smoothness to the first 3 dimensions (spatial coordinates)
-        spatial_coords = z_phy_seq[:, :, :3]  # (batch_size, seq_len, 3)
-        
+
+        # Apply smoothness to the leading geometry dimensions (physics-dependent).
+        n_dims = self.temporal_smoothness_dims
+        geometry_coords = z_phy_seq[:, :, :n_dims]  # (batch_size, seq_len, n_dims)
+
         # Compute variance across the sequence dimension for each batch
-        # var across seq_len dimension: (batch_size, 3)
-        coord_variance = torch.var(spatial_coords, dim=1)  # (batch_size, 3)
-        
-        # Return mean variance across all batches and spatial dimensions
+        # var across seq_len dimension: (batch_size, n_dims)
+        coord_variance = torch.var(geometry_coords, dim=1)  # (batch_size, n_dims)
+
+        # Return mean variance across all batches and geometry dimensions
         return coord_variance.mean()

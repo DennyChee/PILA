@@ -1,0 +1,36 @@
+#!/bin/bash
+# Usage:       qsub submit_SierraNegra_Okada_InSAR_A_iterative.pbs
+# Description: Submit the PILA iterative-refinement training job for experiment
+#              "SierraNegra_Okada_InSAR_A". Identical to the baseline run except the encoder iteratively
+#              refines its source-parameter estimate (arch.phys_vae.iterative_refinement).
+# Date:        2026-06-26
+#PBS -N SN_Okada_InS_IT
+#PBS -P eos_btaisne
+#PBS -q qintel_wfly
+#PBS -l nodes=1:ppn=8
+#PBS -l walltime=12:00:00
+#PBS -l mem=16gb
+#PBS -j oe
+#PBS -o logs/SierraNegra_Okada_InSAR_A_IT_pbs.log
+
+# Exit immediately if any command fails (e.g. a failed conda activate) so the job does
+# not silently waste walltime running in the wrong environment.
+set -e
+
+# --- Move to the directory the job was submitted from (the PILA repo root) ---
+cd "$PBS_O_WORKDIR"
+
+# --- Activate the PILA conda environment ---
+source /eos-rs/miniconda3/etc/profile.d/conda.sh
+conda activate pila
+
+# --- Make the repo importable (data_loader, model, datasets, ... are top-level pkgs) ---
+export PYTHONPATH="${PYTHONPATH}:$PBS_O_WORKDIR"
+
+echo "[SN_Okada_InS_IT] Host: $(hostname)  Env: $CONDA_DEFAULT_ENV  Workdir: $PBS_O_WORKDIR"
+echo "[SN_Okada_InS_IT] Starting iterative-refinement training at $(date)"
+
+# --- Train (iterative refinement enabled via the config) ---
+python train_pila.py --config configs/phys_smpl/SierraNegra_Okada_InSAR_A_iterative.json
+
+echo "[SN_Okada_InS_IT] Finished at $(date)"
