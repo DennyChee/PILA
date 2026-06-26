@@ -441,10 +441,18 @@ def evaluate(truth_json, checkpoint_path, out_dir=None,
     truth_params = np.asarray(truth['params_per_epoch'])      # [n_epoch, n_param] physical
     signal_rms = np.asarray(truth['signal_rms_mm_per_epoch'])
     n_epoch = truth_params.shape[0]
-    kx, ky = LOC_KEYS[physics]
-    ix, iy = truth_names.index(kx), truth_names.index(ky)
 
     attrs = PHYSICS_ATTRS[physics]
+    # Guard: the checkpoint's physics must match the truth cube's parameters. A mismatch
+    # almost always means the wrong --ckpt was paired with this --truth (e.g. a stale
+    # $CKPT pointing at a different cube). Fail loudly instead of deep in the indexing.
+    if sorted(truth_names) != sorted(attrs):
+        raise ValueError(
+            f"checkpoint physics is {physics} (params {attrs}), but truth cube '{name}' "
+            f"has params {truth_names} -- the --ckpt and --truth do not match. Check that "
+            f"--ckpt points at the {name} model (a stale $CKPT from another cube?).")
+    kx, ky = LOC_KEYS[physics]
+    ix, iy = truth_names.index(kx), truth_names.index(ky)
     col = [attrs.index(p) for p in truth_names]     # reorder inferred -> truth order
 
     # ---- point coords for LOS maps (shared by both modes) ----

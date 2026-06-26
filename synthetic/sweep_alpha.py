@@ -187,6 +187,11 @@ def main():
     truth_params = np.asarray(truth['params_per_epoch'])
     signal_rms = np.asarray(truth['signal_rms_mm_per_epoch'])
     n_epoch = truth_params.shape[0]
+    # Guard: checkpoint physics must match the truth cube (catches a stale --ckpt).
+    if sorted(truth_names) != sorted(attrs):
+        raise ValueError(
+            f"checkpoint physics is {physics} (params {attrs}), but truth cube '{name}' "
+            f"has params {truth_names} -- --ckpt and --truth do not match.")
     col = [attrs.index(p) for p in truth_names]
     kx, ky = LOC_KEYS[physics]
     ix, iy = truth_names.index(kx), truth_names.index(ky)
