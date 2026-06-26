@@ -135,6 +135,75 @@ def plot_trajectory_map(out_dir, name, truth_xy_km, inferred_xy_km, signal_rms):
     _save(fig, out_dir, f'{name}_trajectory')
 
 
+def plot_trajectory_compare(out_dir, name, truth_xy_km, raw_xy_km, blend_xy_km,
+                            signal_rms, alpha_label=''):
+    """Map view of the source horizontal trajectory: truth vs RAW per-epoch vs
+    TEMPORALLY-BLENDED inference. Marker size scales with per-epoch signal RMS so
+    well-constrained (strong-signal) epochs stand out.
+
+    truth_xy_km, raw_xy_km, blend_xy_km : [n_epoch, 2] East/North in km.
+    For a genuinely MOVING source the blended path will visibly LAG the truth path
+    when the location alpha is large (temporal-smoothing bias) -- that lag is the
+    quantity this comparison exists to expose.
+    """
+    fig, ax = plt.subplots(figsize=(6.5, 6.5))
+    s = 20 + 120 * (signal_rms / (signal_rms.max() + 1e-12))
+    # truth path (black), raw inference (orange), blended inference (blue)
+    ax.plot(truth_xy_km[:, 0], truth_xy_km[:, 1], 'k-', lw=2, label='truth path')
+    ax.scatter(truth_xy_km[:, 0], truth_xy_km[:, 1], c='k', s=s, alpha=0.4)
+    ax.plot(raw_xy_km[:, 0], raw_xy_km[:, 1], '--', color='C1', label='PILA raw (per-epoch)')
+    ax.scatter(raw_xy_km[:, 0], raw_xy_km[:, 1], c='C1', s=s, alpha=0.5)
+    ax.plot(blend_xy_km[:, 0], blend_xy_km[:, 1], '--', color='C0',
+            label='PILA temporal-blended')
+    ax.scatter(blend_xy_km[:, 0], blend_xy_km[:, 1], c='C0', s=s, alpha=0.6)
+    ax.set_xlabel('East (km)'); ax.set_ylabel('North (km)')
+    ax.set_aspect('equal'); ax.legend(); ax.grid(alpha=0.3)
+    ttl = f'{_pretty(name)}: source trajectory (raw vs temporal)'
+    if alpha_label:
+        ttl += f'\n{alpha_label}'
+    ax.set_title(ttl)
+    _save(fig, out_dir, f'{name}_trajectory_compare')
+
+
+def plot_param_recovery_compare(out_dir, name, param_names, param_units,
+                                truth, raw, blend, signal_rms, alpha_label=''):
+    """One subplot per parameter: truth vs RAW vs TEMPORALLY-BLENDED across epochs.
+
+    truth, raw, blend : [n_epoch, n_param] physical units.
+    signal_rms        : [n_epoch] mm (accepted for signature symmetry; not drawn).
+    """
+    n_param = len(param_names)
+    n_epoch = truth.shape[0]
+    ncol = min(3, n_param)
+    nrow = int(np.ceil(n_param / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(4.5 * ncol, 3.2 * nrow), squeeze=False)
+    ep = np.arange(n_epoch)
+    for j, (pname, punit) in enumerate(zip(param_names, param_units)):
+        ax = axes[j // ncol][j % ncol]
+        ax.plot(ep, truth[:, j], 'k-', lw=2, label='truth')
+        ax.plot(ep, raw[:, j], 'o--', color='C1', ms=3, alpha=0.7, label='PILA raw')
+        ax.plot(ep, blend[:, j], 's--', color='C0', ms=3, alpha=0.8, label='PILA blended')
+        ax.set_xlabel('Epoch index')
+        ax.set_ylabel(pname if not punit else f'{pname} ({punit})')
+        ax.set_title(pname)
+        ax.grid(alpha=0.3)
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    empty = list(range(n_param, nrow * ncol))
+    for j in empty:
+        axes[j // ncol][j % ncol].axis('off')
+    if empty:
+        slot = axes[empty[0] // ncol][empty[0] % ncol]
+        slot.legend(handles, labels, loc='center', frameon=True)
+    else:
+        fig.legend(handles, labels, loc='lower center', ncol=len(labels),
+                   bbox_to_anchor=(0.5, -0.02))
+    suptitle = f'{_pretty(name)}: parameter recovery vs epoch (raw vs temporal)'
+    if alpha_label:
+        suptitle += f'  [{alpha_label}]'
+    fig.suptitle(suptitle, y=1.0)
+    _save(fig, out_dir, f'{name}_param_recovery_compare')
+
+
 def plot_timeseries_montage(out_dir, name, cube_m, dates=None, mask=None,
                             n_frames=12, title_suffix=''):
     """

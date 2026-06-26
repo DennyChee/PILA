@@ -1,7 +1,11 @@
 #!/usr/bin/env python
-# Usage:       python -m synthetic.evaluate \
+# Usage:       # plain per-epoch recovery:
+#              python -m synthetic.evaluate \
 #                  --truth synthetic/cubes/<name>/<name>_truth.json \
 #                  --ckpt  saved/synth/<name>/.../models/model_best.pth
+#              # moving-source temporal-blending test (raw vs blended):
+#              python -m synthetic.evaluate --truth ..._truth.json --ckpt ...model_best.pth \
+#                  --alpha 0.3 [--alpha-loc 0.1] [--alpha-amp 0.0]
 # Description: Quantify how well a trained PILA model recovered the KNOWN synthetic
 #              source parameters. Runs deterministic per-epoch inference, denorms
 #              z -> physical params via the decoder's own rescale(), and compares to
@@ -9,6 +13,11 @@
 #              reconstruction RMSE (mm), source horizontal-location error (km), and
 #              (for moving sources) the trajectory error. Writes a JSON metrics file,
 #              a console table, and recovery / LOS / trajectory plots.
+#              With --alpha it ALSO runs inference-time temporal blending (sequential,
+#              u-space, per-parameter weights) and reports RAW vs BLENDED side by side
+#              -- the moving-source temporal test. Blending trades per-epoch variance
+#              for temporal-lag bias; for a moving source a high location alpha lags
+#              the true migration, so keep --alpha-loc LOW.
 # Scientific notes:
 #   * Recovery is meaningful only on strong-signal epochs: at near-zero deformation
 #     (early cumulative epochs) the source parameters are unconstrained, so we
@@ -44,6 +53,49 @@ PHYSICS_ATTRS = {
 LOC_KEYS = {'Mogi_LOS': ('xcen', 'ycen'), 'Sun69_LOS': ('xcen', 'ycen'),
             'Okada_LOS': ('xoff', 'yoff')}
 
+# Per-physics grouping of parameters for temporal-blending alpha control.
+#   'loc' = source geometry/position -> evolves SLOWLY between epochs. For a STATIONARY
+#           source a high alpha here denoises; for a MOVING source a high alpha LAGS the
+#           true migration (temporal-smoothing bias), so keep it LOW when testing a mover.
+#   'amp' = source amplitude/strength -> can change fast (episodic inflation/deflation),
+#           so a low alpha lets the encoder track it per epoch.
+# Note: for Okada, length/width are fault-plane GEOMETRY (evolve slowly, like position)
+# -> grouped with 'loc'; only 'opening' is the true amplitude/strength -> 'amp'.
+LOC_GROUPS = {
+    'Mogi_LOS':  {'loc': ['xcen', 'ycen', 'd'],                       'amp': ['dV']},
+    'Sun69_LOS': {'loc': ['xcen', 'ycen', 'depth', 'radius'],         'amp': ['dV']},
+    'Okada_LOS': {'loc': ['xoff', 'yoff', 'depth', 'strike', 'dip', 'length', 'width'],
+                  'amp': ['opening']},
+}
+
+
+def build_alpha_vec(attrs, physics, alpha_default, alpha_loc, alpha_amp):
+    """Per-parameter temporal-blending weight vector, in the encoder's `attrs` order.
+
+    Args:
+        attrs         : list of physical-parameter names = PHYSICS_ATTRS[physics], whose
+                        order matches the z_phy / latent columns the decoder rescales.
+        physics       : physics key (e.g. 'Mogi_LOS') -> selects the loc/amp grouping.
+        alpha_default : blend weight applied to every parameter unless overridden.
+                        0 = no temporal smoothing (raw per-epoch); 1 = freeze at prior epoch.
+        alpha_loc     : override weight for the location/geometry group (or None).
+        alpha_amp     : override weight for the amplitude group (or None).
+
+    Returns:
+        np.ndarray shape (len(attrs),) of blend weights, dtype float64.
+    """
+    alpha = np.full(len(attrs), float(alpha_default), dtype=np.float64)
+    groups = LOC_GROUPS.get(physics, {})
+    if alpha_loc is not None:
+        for nm in groups.get('loc', []):
+            if nm in attrs:
+                alpha[attrs.index(nm)] = float(alpha_loc)
+    if alpha_amp is not None:
+        for nm in groups.get('amp', []):
+            if nm in attrs:
+                alpha[attrs.index(nm)] = float(alpha_amp)
+    return alpha
+
 
 def los_field_r2(recon_mm, truth_mm):
     """Squared Pearson correlation r^2 between a reconstructed and a truth LOS field.
@@ -75,12 +127,13 @@ def los_field_r2(recon_mm, truth_mm):
     return r ** 2
 
 
-def run_inference(config, checkpoint_path):
-    """Deterministic per-epoch inference. Returns attrs, params_phys[n,np],
-    pred_std[n,N], target_std[n,N], x_scale(mm), dates."""
-    physics = config['arch']['args']['physics']
-    attrs = PHYSICS_ATTRS[physics]
+def _load_model_and_loader(config, checkpoint_path):
+    """Build the test dataloader and load the trained model (CPU, eval mode).
 
+    shuffle=False is REQUIRED so the epoch order matches the truth sidecar (and so the
+    temporal blend in run_inference_blended sweeps epochs chronologically). Shared by
+    both the raw and the blended inference paths so tau/r loading stays consistent.
+    """
     dl = getattr(module_data, config['data_loader']['type_test'])(
         insar=config['data_loader']['data_dir_test'],
         batch_size=512, shuffle=False, validation_split=0.0, num_workers=0,
@@ -92,6 +145,16 @@ def run_inference(config, checkpoint_path):
     if ckpt.get('tau_r_values') is not None:
         model.dec.set_tau_r_from_checkpoint(ckpt['tau_r_values'])
     model.eval()
+    return model, dl
+
+
+def run_inference(config, checkpoint_path):
+    """Deterministic per-epoch inference. Returns attrs, params_phys[n,np],
+    pred_std[n,N], target_std[n,N], x_scale(mm), dates."""
+    physics = config['arch']['args']['physics']
+    attrs = PHYSICS_ATTRS[physics]
+
+    model, dl = _load_model_and_loader(config, checkpoint_path)
 
     data_key = config['trainer']['input_key']
     target_key = config['trainer']['output_key']
@@ -118,39 +181,127 @@ def run_inference(config, checkpoint_path):
             np.concatenate(targ_list), x_scale, dates)
 
 
-def evaluate(truth_json, checkpoint_path, out_dir=None):
-    with open(truth_json, 'r') as f:
-        truth = json.load(f)
-    cfg_path = os.path.join(os.path.dirname(checkpoint_path), 'config.json')
-    with open(cfg_path, 'r') as f:
-        cfg = json.load(f)
+def run_inference_blended(config, checkpoint_path, alpha_np):
+    """Sequential temporal-blended per-epoch inference for a (possibly moving) source.
 
-    name = truth['name']
-    physics = cfg['arch']['args']['physics']
-    out_dir = out_dir or os.path.join('synthetic', 'eval', name)
-    os.makedirs(out_dir, exist_ok=True)
+    Same model/loader setup as run_inference() (CPU, shuffle=False so epoch order is
+    chronological), but instead of one independent forward pass per epoch it:
 
-    attrs, params_inf, pred_std, targ_std, x_scale, dates = run_inference(cfg, checkpoint_path)
+      1. encodes EVERY epoch to its u-space mean mu_enc[t]  (batched, fast);
+      2. sweeps epochs in time order, blending each epoch's mean with the PREVIOUS
+         epoch's BLENDED result, mapped back to u-space via logit:
+             u_blend[t] = (1 - a) * mu_enc[t] + a * logit(z_blend[t-1])
+         with a = per-parameter weight (alpha_np, in `attrs` order). z_blend[0] = the
+         raw encoder mean (no prior available);
+      3. decodes both the raw (sigmoid of mu_enc) and the blended z to LOS, so the
+         caller can compare reconstruction quality as well as parameter recovery.
 
-    truth_names = truth['param_names']
-    truth_params = np.asarray(truth['params_per_epoch'])      # [n_epoch, n_param] physical
-    signal_rms = np.asarray(truth['signal_rms_mm_per_epoch'])
-    n_epoch = truth_params.shape[0]
+    Scientific note: this is the inference-time analogue of the Stage-B temporal-
+    smoothness regularizer, but applied only at test time (the encoder is unchanged).
+    For a MOVING source a large location alpha biases the path toward earlier epochs
+    (lag); the raw-vs-blended comparison is precisely what quantifies that trade-off.
 
-    # Inference order matches the loader (shuffle=False) -> same epoch order as truth.
-    if params_inf.shape[0] != n_epoch:
-        print(f"  WARNING: {params_inf.shape[0]} inferred epochs vs {n_epoch} truth epochs")
-    n = min(params_inf.shape[0], n_epoch)
+    Returns:
+        attrs, params_raw[n,np], params_blend[n,np], pred_raw[n,N], pred_blend[n,N],
+        targ[n,N], x_scale(mm), dates
+    """
+    physics = config['arch']['args']['physics']
+    attrs = PHYSICS_ATTRS[physics]
 
-    # Reorder inferred columns to the truth's parameter order (they match for these
-    # physics types, but be explicit).
-    col = [attrs.index(p) for p in truth_names]
-    inferred = params_inf[:n, col]
-    tru = truth_params[:n]
-    rms = signal_rms[:n]
+    model, dl = _load_model_and_loader(config, checkpoint_path)
 
-    peak = int(truth.get('peak_epoch_index', int(np.argmax(rms))))
-    strong = rms >= 0.5 * rms.max()                            # well-constrained epochs
+    data_key = config['trainer']['input_key']
+    target_key = config['trainer']['output_key']
+
+    # --- Pass 1: encode every epoch to its u-space mean (chronological order) ---
+    mu_list, zaux_list, tfeat_list, targ_list, dates = [], [], [], [], []
+    have_tfeat = True
+    with torch.no_grad():
+        for batch in dl:
+            data = batch[data_key]; target = batch[target_key]
+            tfeat = batch.get('time_feats', None)
+            if data.dim() == 3:
+                data = data.view(-1, data.size(-1))
+            if target.dim() == 3:
+                target = target.view(-1, target.size(-1))
+            z_phy_stat, z_aux_stat = model.encode(data, tfeat)
+            mu_list.append(z_phy_stat['mean'])          # u-space mean, (b, dim_z_phy)
+            zaux_list.append(z_aux_stat['mean'])        # aux mean (hard draw uses the mean)
+            targ_list.append(target)
+            if tfeat is None:
+                have_tfeat = False
+            else:
+                tfeat_list.append(tfeat)
+            if 'date' in batch:
+                dates += list(batch['date'])
+
+    mu_enc = torch.cat(mu_list, dim=0)                  # (n, dim_z_phy)
+    z_aux_all = torch.cat(zaux_list, dim=0)             # (n, dim_z_aux)
+    targ_all = torch.cat(targ_list, dim=0)             # (n, N)
+    tfeat_all = torch.cat(tfeat_list, dim=0) if have_tfeat else None
+    n = mu_enc.shape[0]
+    print(f"  Encoded {n} epochs: mu_enc shape={tuple(mu_enc.shape)} dtype={mu_enc.dtype}, "
+          f"targets shape={tuple(targ_all.shape)}, time_feats={'yes' if tfeat_all is not None else 'none'}")
+
+    # --- Pass 2: temporal blend recurrence in u-space (per-parameter alpha) ---
+    eps = 1e-6
+    alpha = torch.tensor(alpha_np, dtype=mu_enc.dtype)  # (dim_z_phy,)
+    z_raw = torch.sigmoid(mu_enc)                        # (n, dim_z_phy) raw per-epoch
+    z_blend = torch.empty_like(mu_enc)
+    u_prev = None                                       # previous epoch's blended u-mean
+    for t in range(n):
+        if u_prev is None:
+            u_b = mu_enc[t]                              # first epoch: no prior
+        else:
+            u_b = (1.0 - alpha) * mu_enc[t] + alpha * u_prev
+        z_t = torch.sigmoid(u_b)
+        z_blend[t] = z_t
+        # carry the BLENDED result forward, mapped back to u-space for the next blend
+        u_prev = torch.logit(z_t.clamp(eps, 1.0 - eps))
+
+    # --- Decode raw and blended z to LOS (per epoch, so self.time_feats stays aligned) ---
+    def _decode_all(z_phy_all):
+        preds = []
+        with torch.no_grad():
+            for t in range(n):
+                # decode() reads self.time_feats for the residual; set it per epoch.
+                model.time_feats = tfeat_all[t:t + 1] if tfeat_all is not None else None
+                # epoch/epochs_pretrain are ignored when use_inference_values=True (the
+                # residual scale comes from get_r_for_inference); set explicitly for clarity.
+                x_PB, _x_P, _y, _d, _c = model.decode(
+                    z_phy_all[t:t + 1], z_aux_all[t:t + 1],
+                    epoch=0, epochs_pretrain=0,
+                    full=True, use_inference_values=True,
+                    detach_x_P_for_bias=model.detach_x_P_for_bias)
+                preds.append(x_PB.cpu().numpy())
+        return np.concatenate(preds)
+
+    pred_raw = _decode_all(z_raw)
+    pred_blend = _decode_all(z_blend)
+
+    # --- Rescale z -> physical params (rescale is a pure function of z_phy) ---
+    with torch.no_grad():
+        resc_raw = model.physics_model.rescale(z_raw)
+        resc_blend = model.physics_model.rescale(z_blend)
+    params_raw = torch.stack([resc_raw[k] for k in attrs], dim=1).cpu().numpy()
+    params_blend = torch.stack([resc_blend[k] for k in attrs], dim=1).cpu().numpy()
+
+    x_scale = float(model.physics_model.x_scale.flatten()[0].cpu())
+    return (attrs, params_raw, params_blend, pred_raw, pred_blend,
+            targ_all.cpu().numpy(), x_scale, dates)
+
+
+def _recovery_metrics(inferred, pred_std, targ_std, x_scale, tru, rms, peak, strong,
+                      truth_names, physics):
+    """Recovery-metric dict for ONE inference run (raw OR temporally blended).
+
+    inferred, tru : [n, n_param] physical units, already in the truth's parameter order.
+    pred_std, targ_std : [n, N] standardized LOS (multiply by x_scale for mm).
+    peak/strong/rms : peak epoch index, strong-signal boolean mask, per-epoch signal RMS.
+    Returns the same metric schema used by the original raw evaluate() (minus the
+    name/physics/checkpoint header, which the caller adds).
+    """
+    n = inferred.shape[0]
 
     # --- LOS reconstruction RMSE (mm) ---
     resid_mm = (pred_std[:n] - targ_std[:n]) * x_scale
@@ -187,8 +338,7 @@ def evaluate(truth_json, checkpoint_path, out_dir=None):
     loc_err_peak_km = float(loc_err_km[peak])
     loc_err_strong_km = float(np.mean(loc_err_km[strong])) if strong.any() else float('nan')
 
-    metrics = {
-        'name': name, 'physics': physics, 'checkpoint': checkpoint_path,
+    return {
         'n_epochs': n, 'peak_epoch_index': peak,
         'n_strong_epochs': int(strong.sum()),
         'los_rmse_mm_all': los_rmse_all, 'los_rmse_mm_peak': los_rmse_peak,
@@ -198,28 +348,141 @@ def evaluate(truth_json, checkpoint_path, out_dir=None):
         'x_scale_mm': x_scale,
     }
 
-    # --- Plots ---
-    plots.plot_param_recovery_vs_epoch(out_dir, name, truth_names,
-                                       truth['param_units'], tru, inferred, rms)
-    truth_xy_km = np.column_stack([tru[:, ix], tru[:, iy]]) / 1000.0
-    inf_xy_km = np.column_stack([inferred[:, ix], inferred[:, iy]]) / 1000.0
-    plots.plot_trajectory_map(out_dir, name, truth_xy_km, inf_xy_km, rms)
 
-    # LOS maps at the peak epoch (need point coords from the loader)
+def evaluate(truth_json, checkpoint_path, out_dir=None,
+             alpha=None, alpha_loc=None, alpha_amp=None):
+    """Quantify synthetic source recovery.
+
+    alpha=None (default) : original behaviour -- plain per-epoch inference, one metrics
+                           file + recovery/trajectory/LOS plots.
+    alpha is not None     : ALSO run inference-time temporal blending (per-parameter
+                           weights from build_alpha_vec) and report RAW vs BLENDED side
+                           by side -- the moving-source temporal test.
+    """
+    with open(truth_json, 'r') as f:
+        truth = json.load(f)
+    cfg_path = os.path.join(os.path.dirname(checkpoint_path), 'config.json')
+    with open(cfg_path, 'r') as f:
+        cfg = json.load(f)
+
+    name = truth['name']
+    physics = cfg['arch']['args']['physics']
+    # Default under the repo ROOT so it is independent of the invoking directory.
+    out_dir = out_dir or os.path.join(ROOT, 'synthetic', 'eval', name)
+    os.makedirs(out_dir, exist_ok=True)
+
+    truth_names = truth['param_names']
+    truth_params = np.asarray(truth['params_per_epoch'])      # [n_epoch, n_param] physical
+    signal_rms = np.asarray(truth['signal_rms_mm_per_epoch'])
+    n_epoch = truth_params.shape[0]
+    kx, ky = LOC_KEYS[physics]
+    ix, iy = truth_names.index(kx), truth_names.index(ky)
+
+    attrs = PHYSICS_ATTRS[physics]
+    col = [attrs.index(p) for p in truth_names]     # reorder inferred -> truth order
+
+    # ---- point coords for LOS maps (shared by both modes) ----
     ins = cfg['arch']['args']['insar']
     data = load_insar_mintpy(ins['timeseries'], ins['geometry'], ins.get('mask'),
                              ins['lat0'], ins['lon0'], multilook=ins.get('multilook', 20),
                              coh_valid_frac=ins.get('coh_valid_frac', 0.5), verbose=False)
-    obs_mm = targ_std[peak] * x_scale
-    pred_mm = pred_std[peak] * x_scale
-    plots.plot_los_maps(out_dir, name, data.xE_pts, data.yN_pts, obs_mm, pred_mm,
+
+    # ============================ RAW-ONLY MODE ============================
+    if alpha is None:
+        attrs_, params_inf, pred_std, targ_std, x_scale, dates = run_inference(
+            cfg, checkpoint_path)
+        if params_inf.shape[0] != n_epoch:
+            print(f"  WARNING: {params_inf.shape[0]} inferred epochs vs {n_epoch} truth epochs")
+        n = min(params_inf.shape[0], n_epoch)
+        inferred = params_inf[:n, col]
+        tru = truth_params[:n]; rms = signal_rms[:n]
+        peak = int(truth.get('peak_epoch_index', int(np.argmax(rms))))
+        strong = rms >= 0.5 * rms.max()
+
+        metrics = {'name': name, 'physics': physics, 'checkpoint': checkpoint_path}
+        metrics.update(_recovery_metrics(inferred, pred_std, targ_std, x_scale,
+                                         tru, rms, peak, strong, truth_names, physics))
+
+        plots.plot_param_recovery_vs_epoch(out_dir, name, truth_names,
+                                           truth['param_units'], tru, inferred, rms)
+        truth_xy_km = np.column_stack([tru[:, ix], tru[:, iy]]) / 1000.0
+        inf_xy_km = np.column_stack([inferred[:, ix], inferred[:, iy]]) / 1000.0
+        plots.plot_trajectory_map(out_dir, name, truth_xy_km, inf_xy_km, rms)
+        plots.plot_los_maps(out_dir, name, data.xE_pts, data.yN_pts,
+                            targ_std[peak] * x_scale, pred_std[peak] * x_scale,
+                            truth['epochs'][peak] if peak < len(truth['epochs']) else str(peak))
+
+        with open(os.path.join(out_dir, f'{name}_metrics.json'), 'w') as f:
+            json.dump(metrics, f, indent=2)
+        _print_report(metrics, truth_names)
+        print(f"\nPlots + metrics written to {out_dir}")
+        return metrics
+
+    # ===================== TEMPORAL (RAW vs BLENDED) MODE =====================
+    alpha_vec = build_alpha_vec(attrs, physics, alpha, alpha_loc, alpha_amp)
+    (attrs_, params_raw, params_blend, pred_raw, pred_blend,
+     targ_std, x_scale, dates) = run_inference_blended(cfg, checkpoint_path, alpha_vec)
+
+    if params_raw.shape[0] != n_epoch:
+        print(f"  WARNING: {params_raw.shape[0]} inferred epochs vs {n_epoch} truth epochs")
+    n = min(params_raw.shape[0], n_epoch)
+    inferred_raw = params_raw[:n, col]
+    inferred_blend = params_blend[:n, col]
+    tru = truth_params[:n]; rms = signal_rms[:n]
+    peak = int(truth.get('peak_epoch_index', int(np.argmax(rms))))
+    strong = rms >= 0.5 * rms.max()
+
+    m_raw = _recovery_metrics(inferred_raw, pred_raw, targ_std, x_scale,
+                              tru, rms, peak, strong, truth_names, physics)
+    m_blend = _recovery_metrics(inferred_blend, pred_blend, targ_std, x_scale,
+                                tru, rms, peak, strong, truth_names, physics)
+
+    if not strong.any():
+        print("  WARNING: no strong-signal epochs (rms >= 0.5*max) — "
+              "strong-mean metrics will be NaN.")
+
+    # Positive delta = blending REDUCED the error (improvement).
+    improvement = {
+        'source_loc_err_km_strong_mean': m_raw['source_loc_err_km_strong_mean']
+        - m_blend['source_loc_err_km_strong_mean'],
+        'source_loc_err_km_peak': m_raw['source_loc_err_km_peak']
+        - m_blend['source_loc_err_km_peak'],
+        'los_rmse_mm_all': m_raw['los_rmse_mm_all'] - m_blend['los_rmse_mm_all'],
+        'los_rmse_mm_peak': m_raw['los_rmse_mm_peak'] - m_blend['los_rmse_mm_peak'],
+    }
+
+    alpha_map = {attrs[i]: float(alpha_vec[i]) for i in range(len(attrs))}
+    alpha_label = (f"alpha={alpha}"
+                   + (f", loc={alpha_loc}" if alpha_loc is not None else '')
+                   + (f", amp={alpha_amp}" if alpha_amp is not None else ''))
+
+    metrics = {
+        'name': name, 'physics': physics, 'checkpoint': checkpoint_path,
+        'mode': 'temporal_blend',
+        'alpha_default': alpha, 'alpha_loc': alpha_loc, 'alpha_amp': alpha_amp,
+        'alpha_per_param': alpha_map,
+        'raw': m_raw, 'temporal': m_blend,
+        'improvement_raw_minus_temporal': improvement,
+    }
+
+    # --- Comparison plots (truth vs raw vs blended) ---
+    plots.plot_param_recovery_compare(out_dir, name, truth_names, truth['param_units'],
+                                      tru, inferred_raw, inferred_blend, rms,
+                                      alpha_label=alpha_label)
+    truth_xy_km = np.column_stack([tru[:, ix], tru[:, iy]]) / 1000.0
+    raw_xy_km = np.column_stack([inferred_raw[:, ix], inferred_raw[:, iy]]) / 1000.0
+    blend_xy_km = np.column_stack([inferred_blend[:, ix], inferred_blend[:, iy]]) / 1000.0
+    plots.plot_trajectory_compare(out_dir, name, truth_xy_km, raw_xy_km, blend_xy_km,
+                                  rms, alpha_label=alpha_label)
+    # LOS maps at peak for the BLENDED reconstruction (raw maps come from the raw run).
+    plots.plot_los_maps(out_dir, name, data.xE_pts, data.yN_pts,
+                        targ_std[peak] * x_scale, pred_blend[peak] * x_scale,
                         truth['epochs'][peak] if peak < len(truth['epochs']) else str(peak))
 
-    with open(os.path.join(out_dir, f'{name}_metrics.json'), 'w') as f:
+    with open(os.path.join(out_dir, f'{name}_metrics_temporal.json'), 'w') as f:
         json.dump(metrics, f, indent=2)
-
-    _print_report(metrics, truth_names)
-    print(f"\nPlots + metrics written to {out_dir}")
+    _print_compare(metrics, truth_names)
+    print(f"\nTemporal comparison plots + metrics written to {out_dir}")
     return metrics
 
 
@@ -239,13 +502,57 @@ def _print_report(m, truth_names):
               f"{d['abs_err_peak']:>14.4g}{d['pct_err_peak']:>8.1f}%")
 
 
+def _print_compare(m, truth_names):
+    """Print a raw-vs-temporal recovery comparison table for the moving-source test."""
+    r, t = m['raw'], m['temporal']
+    print("\n" + "=" * 78)
+    print(f"TEMPORAL MOVING-SOURCE RECOVERY: {m['name']}  ({m['physics']})")
+    print(f"alpha per param: {m['alpha_per_param']}")
+    print("=" * 78)
+    print(f"epochs={r['n_epochs']}  peak={r['peak_epoch_index']}  "
+          f"strong-signal epochs={r['n_strong_epochs']}")
+    print(f"\n{'metric':<34}{'raw':>13}{'temporal':>13}{'delta(raw-tmp)':>16}")
+    rows = [
+        ('source loc err (km, strong-mean)', 'source_loc_err_km_strong_mean'),
+        ('source loc err (km, peak)',        'source_loc_err_km_peak'),
+        ('LOS RMSE (mm, all)',               'los_rmse_mm_all'),
+        ('LOS RMSE (mm, peak)',              'los_rmse_mm_peak'),
+    ]
+    for label, key in rows:
+        rv, tv = r[key], t[key]
+        print(f"{label:<34}{rv:>13.4f}{tv:>13.4f}{rv - tv:>16.4f}")
+    print("\n(positive delta = temporal blending REDUCED the error)")
+    # Per-parameter strong-epoch MAE: where smoothing helped vs where it lagged.
+    print(f"\n{'param':<10}{'raw MAE(strong)':>18}{'tmp MAE(strong)':>18}{'delta':>12}")
+    for p in truth_names:
+        rv = r['per_param'][p]['mae_strong_epochs']
+        tv = t['per_param'][p]['mae_strong_epochs']
+        print(f"{p:<10}{rv:>18.4g}{tv:>18.4g}{rv - tv:>12.4g}")
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Evaluate PILA synthetic parameter recovery.")
+    ap = argparse.ArgumentParser(
+        description="Evaluate PILA synthetic parameter recovery. With --alpha, also runs "
+                    "inference-time temporal blending and reports raw vs blended (the "
+                    "moving-source temporal test).")
     ap.add_argument('--truth', required=True, help='Ground-truth sidecar JSON.')
     ap.add_argument('--ckpt', required=True, help='Trained model_best.pth.')
     ap.add_argument('--out', default=None, help='Output dir (default synthetic/eval/<name>).')
+    # --- Temporal-blending controls (omit --alpha for the original raw-only eval) ---
+    ap.add_argument('--alpha', type=float, default=None,
+                    help='Enable temporal blending with this default per-parameter weight. '
+                         '0 = raw per-epoch; 1 = freeze at previous epoch. Typical: 0.2-0.4.')
+    ap.add_argument('--alpha-loc', type=float, default=None,
+                    help='Override blend weight for the source location/geometry group. '
+                         'For a MOVING source keep this LOW (e.g. 0.1) -- a high value lags '
+                         'the true migration. (default: uses --alpha)')
+    ap.add_argument('--alpha-amp', type=float, default=None,
+                    help='Override blend weight for the source amplitude group (dV / opening). '
+                         'Low lets the encoder track fast (episodic) changes. '
+                         '(default: uses --alpha)')
     args = ap.parse_args()
-    evaluate(args.truth, args.ckpt, args.out)
+    evaluate(args.truth, args.ckpt, args.out,
+             alpha=args.alpha, alpha_loc=args.alpha_loc, alpha_amp=args.alpha_amp)
 
 
 if __name__ == '__main__':
