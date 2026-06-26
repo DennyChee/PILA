@@ -97,6 +97,20 @@ def build_alpha_vec(attrs, physics, alpha_default, alpha_loc, alpha_amp):
     return alpha
 
 
+def alpha_tag(alpha, alpha_loc, alpha_amp):
+    """Filesystem-safe tag encoding the blend weights, e.g. 'a0.3_loc0.1_amp0'.
+
+    Used as the per-run output subfolder name so an alpha sweep keeps every run
+    instead of overwriting. loc/amp appear only when explicitly overridden.
+    """
+    tag = f"a{alpha:g}"
+    if alpha_loc is not None:
+        tag += f"_loc{alpha_loc:g}"
+    if alpha_amp is not None:
+        tag += f"_amp{alpha_amp:g}"
+    return tag
+
+
 def los_field_r2(recon_mm, truth_mm):
     """Squared Pearson correlation r^2 between a reconstructed and a truth LOS field.
 
@@ -419,6 +433,11 @@ def evaluate(truth_json, checkpoint_path, out_dir=None,
         return metrics
 
     # ===================== TEMPORAL (RAW vs BLENDED) MODE =====================
+    # Put every alpha run in its own alpha-tagged subfolder so a sweep does not
+    # overwrite previous runs (the tag carries the blend weights, e.g. a0.3_loc0.1_amp0).
+    out_dir = os.path.join(out_dir, alpha_tag(alpha, alpha_loc, alpha_amp))
+    os.makedirs(out_dir, exist_ok=True)
+
     alpha_vec = build_alpha_vec(attrs, physics, alpha, alpha_loc, alpha_amp)
     (attrs_, params_raw, params_blend, pred_raw, pred_blend,
      targ_std, x_scale, dates) = run_inference_blended(cfg, checkpoint_path, alpha_vec)
