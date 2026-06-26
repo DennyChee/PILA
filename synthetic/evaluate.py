@@ -6,6 +6,9 @@
 #              # moving-source temporal-blending test (raw vs blended):
 #              python -m synthetic.evaluate --truth ..._truth.json --ckpt ...model_best.pth \
 #                  --alpha 0 [--alpha-loc 0] [--alpha-depth 0.3] [--alpha-amp 0.0]
+#              # per-parameter weights (highest precedence; exact names, Mogi depth='d'):
+#              python -m synthetic.evaluate --truth ... --ckpt ... \
+#                  --alpha 0 --alpha-param depth=0.5 width=0.3 dip=0.3 opening=0
 # Description: Quantify how well a trained PILA model recovered the KNOWN synthetic
 #              source parameters. Runs deterministic per-epoch inference, denorms
 #              z -> physical params via the decoder's own rescale(), and compares to
@@ -72,18 +75,22 @@ LOC_GROUPS = {
 }
 
 
-def build_alpha_vec(attrs, physics, alpha_default, alpha_loc, alpha_depth, alpha_amp):
+def build_alpha_vec(attrs, physics, alpha_default, alpha_loc=None, alpha_depth=None,
+                    alpha_amp=None, param_alphas=None):
     """Per-parameter temporal-blending weight vector, in the encoder's `attrs` order.
 
+    Precedence (low -> high): alpha_default -> group overrides (loc/depth/amp) ->
+    param_alphas (per-parameter, wins). This lets you use the convenient group knobs OR
+    address individual parameters by name (e.g. Okada {depth, width, dip, opening}).
+
     Args:
-        attrs         : list of physical-parameter names = PHYSICS_ATTRS[physics], whose
-                        order matches the z_phy / latent columns the decoder rescales.
+        attrs         : physical-parameter names = PHYSICS_ATTRS[physics], in z_phy/rescale
+                        column order.
         physics       : physics key (e.g. 'Mogi_LOS') -> selects the loc/depth/amp grouping.
-        alpha_default : blend weight applied to every parameter unless overridden.
-                        0 = no temporal smoothing (raw per-epoch); 1 = freeze at prior epoch.
-        alpha_loc     : override weight for the position/geometry group (or None).
-        alpha_depth   : override weight for the depth group (or None).
-        alpha_amp     : override weight for the amplitude group (or None).
+        alpha_default : weight for every parameter unless overridden. 0 = raw per-epoch.
+        alpha_loc/depth/amp : optional group overrides (None = leave at default).
+        param_alphas  : optional {param_name: weight} dict, highest precedence. Unknown
+                        names raise (catches e.g. Mogi 'depth' vs the real name 'd').
 
     Returns:
         np.ndarray shape (len(attrs),) of blend weights, dtype float64.
@@ -96,14 +103,20 @@ def build_alpha_vec(attrs, physics, alpha_default, alpha_loc, alpha_depth, alpha
             for nm in groups.get(grp_key, []):
                 if nm in attrs:
                     alpha[attrs.index(nm)] = float(grp_alpha)
+    for nm, a in (param_alphas or {}).items():
+        if nm not in attrs:
+            raise ValueError(f"alpha for unknown {physics} parameter '{nm}'; "
+                             f"valid names: {attrs}")
+        alpha[attrs.index(nm)] = float(a)
     return alpha
 
 
-def alpha_tag(alpha, alpha_loc, alpha_depth, alpha_amp):
-    """Filesystem-safe tag encoding the blend weights, e.g. 'a0_loc0_dep0.3_amp0'.
+def alpha_tag(alpha, alpha_loc=None, alpha_depth=None, alpha_amp=None, param_alphas=None):
+    """Filesystem-safe tag encoding the blend weights, e.g. 'a0_loc0_dep0.3_amp0' or, for
+    per-parameter control, 'a0_depth0.3_dip0.3_opening0_width0.3'.
 
-    Used as the per-run output subfolder name so an alpha sweep keeps every run
-    instead of overwriting. loc/depth/amp appear only when explicitly overridden.
+    Used as the per-run output subfolder name so a sweep keeps every run instead of
+    overwriting. Group/param entries appear only when explicitly given.
     """
     tag = f"a{alpha:g}"
     if alpha_loc is not None:
@@ -112,7 +125,22 @@ def alpha_tag(alpha, alpha_loc, alpha_depth, alpha_amp):
         tag += f"_dep{alpha_depth:g}"
     if alpha_amp is not None:
         tag += f"_amp{alpha_amp:g}"
+    for nm in sorted(param_alphas or {}):
+        tag += f"_{nm}{param_alphas[nm]:g}"
     return tag
+
+
+def parse_param_alphas(tokens):
+    """Parse ['name=value', ...] CLI tokens into a {name: float} dict (None -> None)."""
+    if not tokens:
+        return None
+    out = {}
+    for tok in tokens:
+        if '=' not in tok:
+            raise ValueError(f"--alpha-param expects NAME=VALUE tokens, got '{tok}'")
+        nm, val = tok.split('=', 1)
+        out[nm.strip()] = float(val)
+    return out
 
 
 def los_field_r2(recon_mm, truth_mm):
@@ -386,14 +414,16 @@ def _recovery_metrics(inferred, pred_std, targ_std, x_scale, tru, rms, peak, str
 
 
 def evaluate(truth_json, checkpoint_path, out_dir=None,
-             alpha=None, alpha_loc=None, alpha_depth=None, alpha_amp=None):
+             alpha=None, alpha_loc=None, alpha_depth=None, alpha_amp=None,
+             alpha_params=None):
     """Quantify synthetic source recovery.
 
     alpha=None (default) : original behaviour -- plain per-epoch inference, one metrics
                            file + recovery/trajectory/LOS plots.
-    alpha is not None     : ALSO run inference-time temporal blending (per-parameter
-                           weights from build_alpha_vec, loc/depth/amp groups) and report
-                           RAW vs BLENDED side by side -- the moving-source temporal test.
+    alpha is not None     : ALSO run inference-time temporal blending and report RAW vs
+                           BLENDED side by side. Weights come from build_alpha_vec: group
+                           knobs (alpha_loc/depth/amp) and/or a per-parameter
+                           alpha_params={name: weight} dict (highest precedence).
     """
     with open(truth_json, 'r') as f:
         truth = json.load(f)
@@ -457,10 +487,12 @@ def evaluate(truth_json, checkpoint_path, out_dir=None,
     # ===================== TEMPORAL (RAW vs BLENDED) MODE =====================
     # Put every alpha run in its own alpha-tagged subfolder so a sweep does not
     # overwrite previous runs (the tag carries the blend weights, e.g. a0_loc0_dep0.3_amp0).
-    out_dir = os.path.join(out_dir, alpha_tag(alpha, alpha_loc, alpha_depth, alpha_amp))
+    out_dir = os.path.join(out_dir, alpha_tag(alpha, alpha_loc, alpha_depth, alpha_amp,
+                                              alpha_params))
     os.makedirs(out_dir, exist_ok=True)
 
-    alpha_vec = build_alpha_vec(attrs, physics, alpha, alpha_loc, alpha_depth, alpha_amp)
+    alpha_vec = build_alpha_vec(attrs, physics, alpha, alpha_loc, alpha_depth, alpha_amp,
+                                param_alphas=alpha_params)
     (attrs_, params_raw, params_blend, pred_raw, pred_blend,
      targ_std, x_scale, dates) = run_inference_blended(cfg, checkpoint_path, alpha_vec)
 
@@ -496,13 +528,15 @@ def evaluate(truth_json, checkpoint_path, out_dir=None,
     alpha_label = (f"alpha={alpha}"
                    + (f", loc={alpha_loc}" if alpha_loc is not None else '')
                    + (f", depth={alpha_depth}" if alpha_depth is not None else '')
-                   + (f", amp={alpha_amp}" if alpha_amp is not None else ''))
+                   + (f", amp={alpha_amp}" if alpha_amp is not None else '')
+                   + (', ' + ', '.join(f'{k}={v:g}' for k, v in sorted(alpha_params.items()))
+                      if alpha_params else ''))
 
     metrics = {
         'name': name, 'physics': physics, 'checkpoint': checkpoint_path,
         'mode': 'temporal_blend',
         'alpha_default': alpha, 'alpha_loc': alpha_loc, 'alpha_depth': alpha_depth,
-        'alpha_amp': alpha_amp,
+        'alpha_amp': alpha_amp, 'alpha_params': alpha_params,
         'alpha_per_param': alpha_map,
         'raw': m_raw, 'temporal': m_blend,
         'improvement_raw_minus_temporal': improvement,
@@ -598,10 +632,15 @@ def main():
                     help='Override blend weight for the source amplitude group (dV / opening). '
                          'Low lets the encoder track fast (episodic) changes. '
                          '(default: uses --alpha)')
+    ap.add_argument('--alpha-param', nargs='+', default=None, metavar='NAME=VALUE',
+                    help='Per-parameter blend weight(s), highest precedence, e.g. '
+                         '--alpha-param depth=0.5 width=0.3 opening=0. Use exact parameter '
+                         'names (Mogi depth is "d").')
     args = ap.parse_args()
     evaluate(args.truth, args.ckpt, args.out,
              alpha=args.alpha, alpha_loc=args.alpha_loc,
-             alpha_depth=args.alpha_depth, alpha_amp=args.alpha_amp)
+             alpha_depth=args.alpha_depth, alpha_amp=args.alpha_amp,
+             alpha_params=parse_param_alphas(args.alpha_param))
 
 
 if __name__ == '__main__':
