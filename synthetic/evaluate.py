@@ -195,39 +195,43 @@ def run_inference(config, checkpoint_path):
             np.concatenate(targ_list), x_scale, dates)
 
 
-def run_inference_blended(config, checkpoint_path, alpha_np):
-    """Sequential temporal-blended per-epoch inference for a (possibly moving) source.
+def _decode_epochs(model, z_phy_all, z_aux_all, tfeat_all):
+    """Decode each epoch's z to LOS, one epoch at a time so model.time_feats (read by the
+    residual in decode()) stays aligned with the epoch being decoded. Returns pred[n, N]."""
+    n = z_phy_all.shape[0]
+    preds = []
+    with torch.no_grad():
+        for t in range(n):
+            model.time_feats = tfeat_all[t:t + 1] if tfeat_all is not None else None
+            # epoch/epochs_pretrain are ignored when use_inference_values=True (the residual
+            # scale comes from get_r_for_inference); set explicitly for clarity.
+            x_PB, _x_P, _y, _d, _c = model.decode(
+                z_phy_all[t:t + 1], z_aux_all[t:t + 1],
+                epoch=0, epochs_pretrain=0,
+                full=True, use_inference_values=True,
+                detach_x_P_for_bias=model.detach_x_P_for_bias)
+            preds.append(x_PB.cpu().numpy())
+    return np.concatenate(preds)
 
-    Same model/loader setup as run_inference() (CPU, shuffle=False so epoch order is
-    chronological), but instead of one independent forward pass per epoch it:
 
-      1. encodes EVERY epoch to its u-space mean mu_enc[t]  (batched, fast);
-      2. sweeps epochs in time order, blending each epoch's mean with the PREVIOUS
-         epoch's BLENDED result, mapped back to u-space via logit:
-             u_blend[t] = (1 - a) * mu_enc[t] + a * logit(z_blend[t-1])
-         with a = per-parameter weight (alpha_np, in `attrs` order). z_blend[0] = the
-         raw encoder mean (no prior available);
-      3. decodes both the raw (sigmoid of mu_enc) and the blended z to LOS, so the
-         caller can compare reconstruction quality as well as parameter recovery.
+def encode_pass(config, checkpoint_path):
+    """Load the model + data ONCE and encode every epoch to its u-space mean.
 
-    Scientific note: this is the inference-time analogue of the Stage-B temporal-
-    smoothness regularizer, but applied only at test time (the encoder is unchanged).
-    For a MOVING source a large location alpha biases the path toward earlier epochs
-    (lag); the raw-vs-blended comparison is precisely what quantifies that trade-off.
+    Everything returned here is INDEPENDENT of the blend weights, so an alpha sweep can
+    compute it a single time and then call blend_decode() per combo. The RAW (no-blend)
+    decode + rescale is alpha-independent too, so it is done here as well.
 
-    Returns:
-        attrs, params_raw[n,np], params_blend[n,np], pred_raw[n,N], pred_blend[n,N],
-        targ[n,N], x_scale(mm), dates
+    Returns a context dict with: model, attrs, physics, mu_enc[n,np] (u-space means),
+    z_aux_all[n,na], tfeat_all (or None), targ[n,N] (numpy), x_scale(mm), dates,
+    z_raw[n,np], pred_raw[n,N] (numpy), params_raw[n,np] (numpy, physical).
     """
     physics = config['arch']['args']['physics']
     attrs = PHYSICS_ATTRS[physics]
 
     model, dl = _load_model_and_loader(config, checkpoint_path)
-
     data_key = config['trainer']['input_key']
     target_key = config['trainer']['output_key']
 
-    # --- Pass 1: encode every epoch to its u-space mean (chronological order) ---
     mu_list, zaux_list, tfeat_list, targ_list, dates = [], [], [], [], []
     have_tfeat = True
     with torch.no_grad():
@@ -257,52 +261,66 @@ def run_inference_blended(config, checkpoint_path, alpha_np):
     print(f"  Encoded {n} epochs: mu_enc shape={tuple(mu_enc.shape)} dtype={mu_enc.dtype}, "
           f"targets shape={tuple(targ_all.shape)}, time_feats={'yes' if tfeat_all is not None else 'none'}")
 
-    # --- Pass 2: temporal blend recurrence in u-space (per-parameter alpha) ---
-    eps = 1e-6
-    alpha = torch.tensor(alpha_np, dtype=mu_enc.dtype)  # (dim_z_phy,)
-    z_raw = torch.sigmoid(mu_enc)                        # (n, dim_z_phy) raw per-epoch
-    z_blend = torch.empty_like(mu_enc)
-    u_prev = None                                       # previous epoch's blended u-mean
-    for t in range(n):
-        if u_prev is None:
-            u_b = mu_enc[t]                              # first epoch: no prior
-        else:
-            u_b = (1.0 - alpha) * mu_enc[t] + alpha * u_prev
-        z_t = torch.sigmoid(u_b)
-        z_blend[t] = z_t
-        # carry the BLENDED result forward, mapped back to u-space for the next blend
-        u_prev = torch.logit(z_t.clamp(eps, 1.0 - eps))
-
-    # --- Decode raw and blended z to LOS (per epoch, so self.time_feats stays aligned) ---
-    def _decode_all(z_phy_all):
-        preds = []
-        with torch.no_grad():
-            for t in range(n):
-                # decode() reads self.time_feats for the residual; set it per epoch.
-                model.time_feats = tfeat_all[t:t + 1] if tfeat_all is not None else None
-                # epoch/epochs_pretrain are ignored when use_inference_values=True (the
-                # residual scale comes from get_r_for_inference); set explicitly for clarity.
-                x_PB, _x_P, _y, _d, _c = model.decode(
-                    z_phy_all[t:t + 1], z_aux_all[t:t + 1],
-                    epoch=0, epochs_pretrain=0,
-                    full=True, use_inference_values=True,
-                    detach_x_P_for_bias=model.detach_x_P_for_bias)
-                preds.append(x_PB.cpu().numpy())
-        return np.concatenate(preds)
-
-    pred_raw = _decode_all(z_raw)
-    pred_blend = _decode_all(z_blend)
-
-    # --- Rescale z -> physical params (rescale is a pure function of z_phy) ---
+    # RAW (alpha-independent) decode + rescale.
+    z_raw = torch.sigmoid(mu_enc)
+    pred_raw = _decode_epochs(model, z_raw, z_aux_all, tfeat_all)
     with torch.no_grad():
         resc_raw = model.physics_model.rescale(z_raw)
-        resc_blend = model.physics_model.rescale(z_blend)
     params_raw = torch.stack([resc_raw[k] for k in attrs], dim=1).cpu().numpy()
-    params_blend = torch.stack([resc_blend[k] for k in attrs], dim=1).cpu().numpy()
-
     x_scale = float(model.physics_model.x_scale.flatten()[0].cpu())
-    return (attrs, params_raw, params_blend, pred_raw, pred_blend,
-            targ_all.cpu().numpy(), x_scale, dates)
+
+    return {'model': model, 'attrs': attrs, 'physics': physics, 'mu_enc': mu_enc,
+            'z_aux_all': z_aux_all, 'tfeat_all': tfeat_all, 'targ': targ_all.cpu().numpy(),
+            'x_scale': x_scale, 'dates': dates, 'z_raw': z_raw, 'pred_raw': pred_raw,
+            'params_raw': params_raw}
+
+
+def blend_decode(ctx, alpha_np):
+    """Apply the u-space temporal-blend recurrence for ONE alpha vector, reusing the
+    precomputed encoder means in ctx (NO re-encode), then decode the blended z.
+
+    Recurrence (per-parameter weight a = alpha_np, in attrs order):
+        u_blend[t] = (1 - a) * mu_enc[t] + a * logit(z_blend[t-1])     (z_blend[0] = raw)
+    Carries the BLENDED result forward (mirrors the trainer's Stage-B smoother and
+    test_pila_mogi_temporal.py). For a MOVING source a large location alpha lags the
+    true migration -- that variance-vs-lag trade-off is what a sweep maps out.
+
+    Returns (params_blend[n,np] physical numpy, pred_blend[n,N] numpy).
+    """
+    mu_enc = ctx['mu_enc']; model = ctx['model']; attrs = ctx['attrs']
+    eps = 1e-6
+    alpha = torch.tensor(alpha_np, dtype=mu_enc.dtype)  # (dim_z_phy,)
+    n = mu_enc.shape[0]
+    z_blend = torch.empty_like(mu_enc)
+    u_prev = None
+    for t in range(n):
+        u_b = mu_enc[t] if u_prev is None else (1.0 - alpha) * mu_enc[t] + alpha * u_prev
+        z_t = torch.sigmoid(u_b)
+        z_blend[t] = z_t
+        u_prev = torch.logit(z_t.clamp(eps, 1.0 - eps))
+
+    pred_blend = _decode_epochs(model, z_blend, ctx['z_aux_all'], ctx['tfeat_all'])
+    with torch.no_grad():
+        resc = model.physics_model.rescale(z_blend)
+    params_blend = torch.stack([resc[k] for k in attrs], dim=1).cpu().numpy()
+    return params_blend, pred_blend
+
+
+def run_inference_blended(config, checkpoint_path, alpha_np):
+    """Sequential temporal-blended per-epoch inference for a (possibly moving) source.
+
+    Thin wrapper: encode_pass() (load + encode + raw decode, all alpha-independent) then
+    blend_decode() for the given alpha. Kept for the single-alpha evaluate() path; a sweep
+    should call encode_pass() once and blend_decode() per combo instead.
+
+    Returns:
+        attrs, params_raw[n,np], params_blend[n,np], pred_raw[n,N], pred_blend[n,N],
+        targ[n,N], x_scale(mm), dates
+    """
+    ctx = encode_pass(config, checkpoint_path)
+    params_blend, pred_blend = blend_decode(ctx, alpha_np)
+    return (ctx['attrs'], ctx['params_raw'], params_blend, ctx['pred_raw'], pred_blend,
+            ctx['targ'], ctx['x_scale'], ctx['dates'])
 
 
 def _recovery_metrics(inferred, pred_std, targ_std, x_scale, tru, rms, peak, strong,
