@@ -307,7 +307,50 @@ def encode_pass(config, checkpoint_path):
             'params_raw': params_raw}
 
 
-def blend_decode(ctx, alpha_np):
+def refit_amplitude(ctx, z_blend):
+    """COUPLING STEP (option A): hold the BLENDED geometry fixed and re-solve the amplitude
+    parameter (Mogi dV / Okada opening) per epoch by a closed-form fit of the physics field
+    to the OBSERVED field.
+
+    The forward model is linear in the amplitude, so for a fixed geometry the standardized
+    physics field is affine in it: f(v) = G*v + C0. Two decoder renders (the amplitude dim
+    set to 0.4 and 0.6, geometry untouched) give G and C0 per pixel; the amplitude that best
+    matches the observed field is then the closed-form least-squares scale
+        v_fit = (G . (obs - C0)) / (G . G)        (per epoch, no temporal coupling -> no lag)
+    Because v_fit is conditioned on the pinned geometry, this is the coupling the per-dimension
+    blend lacks: changing the pooled depth changes the template and hence the fitted amplitude.
+
+    Returns z with the amplitude dim replaced (geometry/position dims untouched).
+    """
+    model = ctx['model']; attrs = ctx['attrs']; physics = ctx['physics']
+    amp_params = LOC_GROUPS[physics]['amp']
+    if len(amp_params) != 1:
+        raise NotImplementedError(f"refit-amp supports one amplitude param, got {amp_params}")
+    amp = amp_params[0]
+    j = attrs.index(amp)
+    obs = torch.tensor(ctx['targ'], dtype=z_blend.dtype)        # [n, N] standardized observed
+
+    za = z_blend.clone(); za[:, j] = 0.4                        # two probe points for amp dim
+    zb = z_blend.clone(); zb[:, j] = 0.6
+    with torch.no_grad():
+        fa = model.physics_model(za, const=None)                # [n, N] standardized physics
+        fb = model.physics_model(zb, const=None)
+        va = model.physics_model.rescale(za)[amp]               # [n] physical amplitude at za
+        vb = model.physics_model.rescale(zb)[amp]
+    dvab = (vb - va).unsqueeze(1)                               # [n, 1]
+    G = (fb - fa) / dvab                                        # [n, N] d(field)/d(amplitude)
+    C0 = fa - G * va.unsqueeze(1)                               # [n, N] field at amplitude 0
+    # closed-form least-squares amplitude that best reproduces the observed field per epoch
+    v_fit = (G * (obs - C0)).sum(dim=1) / (G * G).sum(dim=1).clamp_min(1e-30)
+    # invert the (affine) rescale to put the fitted amplitude back into z-space
+    slope = (vb - va) / (0.6 - 0.4)                             # physical amplitude per unit z
+    z_fit = ((v_fit - (va - slope * 0.4)) / slope.clamp_min(1e-30)).clamp(1e-6, 1.0 - 1e-6)
+    z_refit = z_blend.clone()
+    z_refit[:, j] = z_fit
+    return z_refit
+
+
+def blend_decode(ctx, alpha_np, refit_amp=False):
     """Apply the u-space temporal-blend recurrence for ONE alpha vector, reusing the
     precomputed encoder means in ctx (NO re-encode), then decode the blended z.
 
@@ -316,6 +359,10 @@ def blend_decode(ctx, alpha_np):
     Carries the BLENDED result forward (mirrors the trainer's Stage-B smoother and
     test_pila_mogi_temporal.py). For a MOVING source a large location alpha lags the
     true migration -- that variance-vs-lag trade-off is what a sweep maps out.
+
+    refit_amp: if True, after blending, re-solve the amplitude (dV/opening) per epoch from
+    the data with the blended geometry held fixed (option A, see refit_amplitude) -- gives a
+    low-variance, un-lagged amplitude coupled to the pooled geometry.
 
     Returns (params_blend[n,np] physical numpy, pred_blend[n,N] numpy).
     """
@@ -331,6 +378,9 @@ def blend_decode(ctx, alpha_np):
         z_blend[t] = z_t
         u_prev = torch.logit(z_t.clamp(eps, 1.0 - eps))
 
+    if refit_amp:
+        z_blend = refit_amplitude(ctx, z_blend)
+
     pred_blend = _decode_epochs(model, z_blend, ctx['z_aux_all'], ctx['tfeat_all'])
     with torch.no_grad():
         resc = model.physics_model.rescale(z_blend)
@@ -338,7 +388,7 @@ def blend_decode(ctx, alpha_np):
     return params_blend, pred_blend
 
 
-def run_inference_blended(config, checkpoint_path, alpha_np):
+def run_inference_blended(config, checkpoint_path, alpha_np, refit_amp=False):
     """Sequential temporal-blended per-epoch inference for a (possibly moving) source.
 
     Thin wrapper: encode_pass() (load + encode + raw decode, all alpha-independent) then
@@ -350,7 +400,7 @@ def run_inference_blended(config, checkpoint_path, alpha_np):
         targ[n,N], x_scale(mm), dates
     """
     ctx = encode_pass(config, checkpoint_path)
-    params_blend, pred_blend = blend_decode(ctx, alpha_np)
+    params_blend, pred_blend = blend_decode(ctx, alpha_np, refit_amp=refit_amp)
     return (ctx['attrs'], ctx['params_raw'], params_blend, ctx['pred_raw'], pred_blend,
             ctx['targ'], ctx['x_scale'], ctx['dates'])
 
@@ -415,7 +465,7 @@ def _recovery_metrics(inferred, pred_std, targ_std, x_scale, tru, rms, peak, str
 
 def evaluate(truth_json, checkpoint_path, out_dir=None,
              alpha=None, alpha_loc=None, alpha_depth=None, alpha_amp=None,
-             alpha_params=None):
+             alpha_params=None, refit_amp=False):
     """Quantify synthetic source recovery.
 
     alpha=None (default) : original behaviour -- plain per-epoch inference, one metrics
@@ -495,14 +545,17 @@ def evaluate(truth_json, checkpoint_path, out_dir=None,
     # ===================== TEMPORAL (RAW vs BLENDED) MODE =====================
     # Put every alpha run in its own alpha-tagged subfolder so a sweep does not
     # overwrite previous runs (the tag carries the blend weights, e.g. a0_loc0_dep0.3_amp0).
-    out_dir = os.path.join(out_dir, alpha_tag(alpha, alpha_loc, alpha_depth, alpha_amp,
-                                              alpha_params))
+    tag = alpha_tag(alpha, alpha_loc, alpha_depth, alpha_amp, alpha_params)
+    if refit_amp:
+        tag += '_refitamp'      # keep refit runs in their own folder
+    out_dir = os.path.join(out_dir, tag)
     os.makedirs(out_dir, exist_ok=True)
 
     alpha_vec = build_alpha_vec(attrs, physics, alpha, alpha_loc, alpha_depth, alpha_amp,
                                 param_alphas=alpha_params)
     (attrs_, params_raw, params_blend, pred_raw, pred_blend,
-     targ_std, x_scale, dates) = run_inference_blended(cfg, checkpoint_path, alpha_vec)
+     targ_std, x_scale, dates) = run_inference_blended(cfg, checkpoint_path, alpha_vec,
+                                                       refit_amp=refit_amp)
 
     if params_raw.shape[0] != n_epoch:
         print(f"  WARNING: {params_raw.shape[0]} inferred epochs vs {n_epoch} truth epochs")
@@ -544,7 +597,7 @@ def evaluate(truth_json, checkpoint_path, out_dir=None,
         'name': name, 'physics': physics, 'checkpoint': checkpoint_path,
         'mode': 'temporal_blend',
         'alpha_default': alpha, 'alpha_loc': alpha_loc, 'alpha_depth': alpha_depth,
-        'alpha_amp': alpha_amp, 'alpha_params': alpha_params,
+        'alpha_amp': alpha_amp, 'alpha_params': alpha_params, 'refit_amp': refit_amp,
         'alpha_per_param': alpha_map,
         'raw': m_raw, 'temporal': m_blend,
         'improvement_raw_minus_temporal': improvement,
@@ -644,11 +697,16 @@ def main():
                     help='Per-parameter blend weight(s), highest precedence, e.g. '
                          '--alpha-param depth=0.5 width=0.3 opening=0. Use exact parameter '
                          'names (Mogi depth is "d").')
+    ap.add_argument('--refit-amp', action='store_true',
+                    help='Coupling (option A): after blending, hold the blended geometry '
+                         'fixed and re-solve the amplitude (dV/opening) per epoch by a '
+                         'closed-form fit to the data -- low-variance, un-lagged amplitude '
+                         'coupled to the pooled geometry.')
     args = ap.parse_args()
     evaluate(args.truth, args.ckpt, args.out,
              alpha=args.alpha, alpha_loc=args.alpha_loc,
              alpha_depth=args.alpha_depth, alpha_amp=args.alpha_amp,
-             alpha_params=parse_param_alphas(args.alpha_param))
+             alpha_params=parse_param_alphas(args.alpha_param), refit_amp=args.refit_amp)
 
 
 if __name__ == '__main__':

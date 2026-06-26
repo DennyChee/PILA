@@ -147,6 +147,9 @@ def main():
                     help='Fix OTHER axes/params at given alphas, e.g. --fix width=0.3 dip=0.3.')
     ap.add_argument('--alpha', type=float, default=0.0,
                     help='Fallback weight for anything not swept/faceted/fixed. Default 0.0.')
+    ap.add_argument('--refit-amp', action='store_true',
+                    help='Coupling (option A): re-solve the amplitude (dV/opening) per epoch '
+                         'from the data with the blended geometry held fixed.')
     ap.add_argument('--out', default=None, help='Base output dir (default synthetic/eval/<name>).')
     ap.add_argument('--per-combo-plots', action='store_true',
                     help='Also write per-combo truth/raw/blended trajectory + recovery plots.')
@@ -249,10 +252,12 @@ def main():
                         param_alphas[nm] = val
                 tag = "a{:g}".format(args.alpha) + ''.join(
                     f"_{tok}{tok_val[tok]:g}" for tok in sorted(tok_val))
+                if args.refit_amp:
+                    tag += '_refitamp'
                 print(f"  ({k}/{n_combo}) {tag} ...", flush=True)
 
                 alpha_vec = build_alpha_vec(attrs, physics, args.alpha, param_alphas=param_alphas)
-                params_blend, pred_blend = blend_decode(ctx, alpha_vec)
+                params_blend, pred_blend = blend_decode(ctx, alpha_vec, refit_amp=args.refit_amp)
                 inferred_blend = params_blend[:n, col]
                 m_blend = _recovery_metrics(inferred_blend, pred_blend, ctx['targ'], x_scale,
                                             tru, rms, peak, strong, truth_names, physics)
