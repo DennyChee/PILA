@@ -5,7 +5,7 @@
 #                  --ckpt  saved/synth/<name>/.../models/model_best.pth
 #              # moving-source temporal-blending test (raw vs blended):
 #              python -m synthetic.evaluate --truth ..._truth.json --ckpt ...model_best.pth \
-#                  --alpha 0.3 [--alpha-loc 0.1] [--alpha-amp 0.0]
+#                  --alpha 0 [--alpha-loc 0] [--alpha-depth 0.3] [--alpha-amp 0.0]
 # Description: Quantify how well a trained PILA model recovered the KNOWN synthetic
 #              source parameters. Runs deterministic per-epoch inference, denorms
 #              z -> physical params via the decoder's own rescale(), and compares to
@@ -54,31 +54,35 @@ LOC_KEYS = {'Mogi_LOS': ('xcen', 'ycen'), 'Sun69_LOS': ('xcen', 'ycen'),
             'Okada_LOS': ('xoff', 'yoff')}
 
 # Per-physics grouping of parameters for temporal-blending alpha control.
-#   'loc' = source geometry/position -> evolves SLOWLY between epochs. For a STATIONARY
-#           source a high alpha here denoises; for a MOVING source a high alpha LAGS the
-#           true migration (temporal-smoothing bias), so keep it LOW when testing a mover.
-#   'amp' = source amplitude/strength -> can change fast (episodic inflation/deflation),
-#           so a low alpha lets the encoder track it per epoch.
-# Note: for Okada, length/width are fault-plane GEOMETRY (evolve slowly, like position)
-# -> grouped with 'loc'; only 'opening' is the true amplitude/strength -> 'amp'.
+#   'loc'   = horizontal position + remaining geometry -> evolves SLOWLY / usually well
+#             constrained. For a MOVING source a high alpha here LAGS the true migration,
+#             so keep it LOW when testing a mover.
+#   'depth' = source depth -- its OWN group because it is the ill-constrained half of the
+#             depth-amplitude trade-off and usually wants harder smoothing than the
+#             (well-converged) horizontal position. Mogi names this parameter 'd'.
+#   'amp'   = source amplitude/strength (dV / opening) -> genuinely time-varying (episodic
+#             inflation/deflation), so a low alpha lets the encoder track it per epoch.
+# Note: for Okada, length/width are fault-plane GEOMETRY (evolve slowly) -> 'loc'; only
+# 'opening' is the true amplitude -> 'amp'.
 LOC_GROUPS = {
-    'Mogi_LOS':  {'loc': ['xcen', 'ycen', 'd'],                       'amp': ['dV']},
-    'Sun69_LOS': {'loc': ['xcen', 'ycen', 'depth', 'radius'],         'amp': ['dV']},
-    'Okada_LOS': {'loc': ['xoff', 'yoff', 'depth', 'strike', 'dip', 'length', 'width'],
-                  'amp': ['opening']},
+    'Mogi_LOS':  {'loc': ['xcen', 'ycen'],           'depth': ['d'],     'amp': ['dV']},
+    'Sun69_LOS': {'loc': ['xcen', 'ycen', 'radius'], 'depth': ['depth'], 'amp': ['dV']},
+    'Okada_LOS': {'loc': ['xoff', 'yoff', 'strike', 'dip', 'length', 'width'],
+                  'depth': ['depth'], 'amp': ['opening']},
 }
 
 
-def build_alpha_vec(attrs, physics, alpha_default, alpha_loc, alpha_amp):
+def build_alpha_vec(attrs, physics, alpha_default, alpha_loc, alpha_depth, alpha_amp):
     """Per-parameter temporal-blending weight vector, in the encoder's `attrs` order.
 
     Args:
         attrs         : list of physical-parameter names = PHYSICS_ATTRS[physics], whose
                         order matches the z_phy / latent columns the decoder rescales.
-        physics       : physics key (e.g. 'Mogi_LOS') -> selects the loc/amp grouping.
+        physics       : physics key (e.g. 'Mogi_LOS') -> selects the loc/depth/amp grouping.
         alpha_default : blend weight applied to every parameter unless overridden.
                         0 = no temporal smoothing (raw per-epoch); 1 = freeze at prior epoch.
-        alpha_loc     : override weight for the location/geometry group (or None).
+        alpha_loc     : override weight for the position/geometry group (or None).
+        alpha_depth   : override weight for the depth group (or None).
         alpha_amp     : override weight for the amplitude group (or None).
 
     Returns:
@@ -86,26 +90,26 @@ def build_alpha_vec(attrs, physics, alpha_default, alpha_loc, alpha_amp):
     """
     alpha = np.full(len(attrs), float(alpha_default), dtype=np.float64)
     groups = LOC_GROUPS.get(physics, {})
-    if alpha_loc is not None:
-        for nm in groups.get('loc', []):
-            if nm in attrs:
-                alpha[attrs.index(nm)] = float(alpha_loc)
-    if alpha_amp is not None:
-        for nm in groups.get('amp', []):
-            if nm in attrs:
-                alpha[attrs.index(nm)] = float(alpha_amp)
+    for grp_alpha, grp_key in [(alpha_loc, 'loc'), (alpha_depth, 'depth'),
+                               (alpha_amp, 'amp')]:
+        if grp_alpha is not None:
+            for nm in groups.get(grp_key, []):
+                if nm in attrs:
+                    alpha[attrs.index(nm)] = float(grp_alpha)
     return alpha
 
 
-def alpha_tag(alpha, alpha_loc, alpha_amp):
-    """Filesystem-safe tag encoding the blend weights, e.g. 'a0.3_loc0.1_amp0'.
+def alpha_tag(alpha, alpha_loc, alpha_depth, alpha_amp):
+    """Filesystem-safe tag encoding the blend weights, e.g. 'a0_loc0_dep0.3_amp0'.
 
     Used as the per-run output subfolder name so an alpha sweep keeps every run
-    instead of overwriting. loc/amp appear only when explicitly overridden.
+    instead of overwriting. loc/depth/amp appear only when explicitly overridden.
     """
     tag = f"a{alpha:g}"
     if alpha_loc is not None:
         tag += f"_loc{alpha_loc:g}"
+    if alpha_depth is not None:
+        tag += f"_dep{alpha_depth:g}"
     if alpha_amp is not None:
         tag += f"_amp{alpha_amp:g}"
     return tag
@@ -382,14 +386,14 @@ def _recovery_metrics(inferred, pred_std, targ_std, x_scale, tru, rms, peak, str
 
 
 def evaluate(truth_json, checkpoint_path, out_dir=None,
-             alpha=None, alpha_loc=None, alpha_amp=None):
+             alpha=None, alpha_loc=None, alpha_depth=None, alpha_amp=None):
     """Quantify synthetic source recovery.
 
     alpha=None (default) : original behaviour -- plain per-epoch inference, one metrics
                            file + recovery/trajectory/LOS plots.
     alpha is not None     : ALSO run inference-time temporal blending (per-parameter
-                           weights from build_alpha_vec) and report RAW vs BLENDED side
-                           by side -- the moving-source temporal test.
+                           weights from build_alpha_vec, loc/depth/amp groups) and report
+                           RAW vs BLENDED side by side -- the moving-source temporal test.
     """
     with open(truth_json, 'r') as f:
         truth = json.load(f)
@@ -452,11 +456,11 @@ def evaluate(truth_json, checkpoint_path, out_dir=None,
 
     # ===================== TEMPORAL (RAW vs BLENDED) MODE =====================
     # Put every alpha run in its own alpha-tagged subfolder so a sweep does not
-    # overwrite previous runs (the tag carries the blend weights, e.g. a0.3_loc0.1_amp0).
-    out_dir = os.path.join(out_dir, alpha_tag(alpha, alpha_loc, alpha_amp))
+    # overwrite previous runs (the tag carries the blend weights, e.g. a0_loc0_dep0.3_amp0).
+    out_dir = os.path.join(out_dir, alpha_tag(alpha, alpha_loc, alpha_depth, alpha_amp))
     os.makedirs(out_dir, exist_ok=True)
 
-    alpha_vec = build_alpha_vec(attrs, physics, alpha, alpha_loc, alpha_amp)
+    alpha_vec = build_alpha_vec(attrs, physics, alpha, alpha_loc, alpha_depth, alpha_amp)
     (attrs_, params_raw, params_blend, pred_raw, pred_blend,
      targ_std, x_scale, dates) = run_inference_blended(cfg, checkpoint_path, alpha_vec)
 
@@ -491,12 +495,14 @@ def evaluate(truth_json, checkpoint_path, out_dir=None,
     alpha_map = {attrs[i]: float(alpha_vec[i]) for i in range(len(attrs))}
     alpha_label = (f"alpha={alpha}"
                    + (f", loc={alpha_loc}" if alpha_loc is not None else '')
+                   + (f", depth={alpha_depth}" if alpha_depth is not None else '')
                    + (f", amp={alpha_amp}" if alpha_amp is not None else ''))
 
     metrics = {
         'name': name, 'physics': physics, 'checkpoint': checkpoint_path,
         'mode': 'temporal_blend',
-        'alpha_default': alpha, 'alpha_loc': alpha_loc, 'alpha_amp': alpha_amp,
+        'alpha_default': alpha, 'alpha_loc': alpha_loc, 'alpha_depth': alpha_depth,
+        'alpha_amp': alpha_amp,
         'alpha_per_param': alpha_map,
         'raw': m_raw, 'temporal': m_blend,
         'improvement_raw_minus_temporal': improvement,
@@ -580,16 +586,22 @@ def main():
                     help='Enable temporal blending with this default per-parameter weight. '
                          '0 = raw per-epoch; 1 = freeze at previous epoch. Typical: 0.2-0.4.')
     ap.add_argument('--alpha-loc', type=float, default=None,
-                    help='Override blend weight for the source location/geometry group. '
+                    help='Override blend weight for the position/geometry group. '
                          'For a MOVING source keep this LOW (e.g. 0.1) -- a high value lags '
                          'the true migration. (default: uses --alpha)')
+    ap.add_argument('--alpha-depth', type=float, default=None,
+                    help='Override blend weight for the depth group (Mogi d / Okada-Sun69 '
+                         'depth). Depth is the ill-constrained half of the depth-amplitude '
+                         'trade-off, so a HIGHER alpha here pools it across epochs. '
+                         '(default: uses --alpha)')
     ap.add_argument('--alpha-amp', type=float, default=None,
                     help='Override blend weight for the source amplitude group (dV / opening). '
                          'Low lets the encoder track fast (episodic) changes. '
                          '(default: uses --alpha)')
     args = ap.parse_args()
     evaluate(args.truth, args.ckpt, args.out,
-             alpha=args.alpha, alpha_loc=args.alpha_loc, alpha_amp=args.alpha_amp)
+             alpha=args.alpha, alpha_loc=args.alpha_loc,
+             alpha_depth=args.alpha_depth, alpha_amp=args.alpha_amp)
 
 
 if __name__ == '__main__':
