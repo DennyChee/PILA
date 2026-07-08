@@ -1,0 +1,55 @@
+#!/bin/bash
+# Usage:       qsub -W depend=afterok:<base_jobid> submit_iterprior_marapi_mogi_move_loc_tightloc.pbs
+# Description: Test A (MOVE LOCATION ONLY), TIGHT prior (loc_std=0.2, amp_std=0.4). Reuses the
+#              base encoder E0 trained by submit_iterprior_marapi_mogi_move_loc.pbs (submit
+#              with an afterok dependency so E0 exists first). Isolates the single change
+#              (prior width) vs the loose control on the same cube + same E0.
+# Date:        2026-07-07
+#PBS -N iterprior_move_loc_tight
+#PBS -P eos_btaisne
+#PBS -q qintel_wfly
+#PBS -l nodes=1:ppn=8
+#PBS -l walltime=12:00:00
+#PBS -l mem=16gb
+#PBS -j oe
+#PBS -o logs/iterprior_move_loc_tightloc_pbs.log
+
+set -e
+cd "$PBS_O_WORKDIR"
+
+# --- Environment (project env is 'pila', NOT base) ---
+source /eos-rs/miniconda3/etc/profile.d/conda.sh
+conda activate pila
+export PYTHONPATH="${PYTHONPATH}:$PBS_O_WORKDIR"
+
+echo "[move_loc_tight] Host: $(hostname)  Env: $CONDA_DEFAULT_ENV  Workdir: $PBS_O_WORKDIR"
+echo "[move_loc_tight] Start: $(date)"
+
+# --- Named paths ---
+ITER_CONFIG="configs/synth/marapi_mogi_move_loc_iterprior_tightloc.json"
+BASE_SAVE_DIR="saved/iterprior_marapi_mogi_move_loc/base"
+OUT_DIR="saved/iterprior_marapi_mogi_move_loc/tightloc"
+TRUTH_JSON="synthetic/cubes/marapi_mogi_move_loc/marapi_mogi_move_loc_truth.json"
+
+# --- Reuse the base encoder E0 (newest model_best.pth from the base job) ---
+BASE_CKPT="$(find "$BASE_SAVE_DIR" -name model_best.pth -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
+if [ -z "$BASE_CKPT" ]; then
+  echo "[move_loc_tight] ERROR: no base model_best.pth under $BASE_SAVE_DIR (run the base job first)" >&2
+  exit 1
+fi
+mkdir -p "$OUT_DIR"
+echo "[move_loc_tight] Base checkpoint: $BASE_CKPT"
+
+# --- TIGHT sequential previous-epoch-as-prior refit over all epochs ---
+echo "[move_loc_tight] Step 1/2: sequential prior retraining (TIGHT loc_std=0.2)..."
+SERIES_CSV="$OUT_DIR/iterprior_series.csv"
+python run_iterative_prior_refit.py \
+  --config "$ITER_CONFIG" \
+  --resume "$BASE_CKPT" \
+  --out "$SERIES_CSV"
+
+echo "[move_loc_tight] Step 2/2: plotting recovered vs truth..."
+python plot_iterprior_vs_truth.py --series "$SERIES_CSV" --truth "$TRUTH_JSON" || \
+  echo "[move_loc_tight] WARN: plotting failed (series CSV still written)."
+
+echo "[move_loc_tight] Finished: $(date)"

@@ -1,0 +1,40 @@
+#!/bin/bash
+# Usage:       qsub submit_iterprior_7dB_beta5_par.pbs
+# Description: Parallel 7 dB tight-prior beta=5 refit WITH --settle, reusing the existing 7 dB
+#              base encoder E0 (no retraining). Companion to the beta=2 job; together with the
+#              existing beta=0.5 tightloc run they form the 7 dB beta sweep 0.5 -> 2 -> 5, the
+#              regime where the prior has headroom to reduce d/dV fluctuation. Writes to a
+#              dedicated dir (beta5_par). Auto-plots vs truth.
+# Date:        2026-07-08
+#PBS -N itp7_beta5
+#PBS -P eos_btaisne
+#PBS -q qintel_wfly
+#PBS -l nodes=1:ppn=8
+#PBS -l walltime=12:00:00
+#PBS -l mem=16gb
+#PBS -j oe
+#PBS -o logs/iterprior_7dB_beta5_par_pbs.log
+
+set -e
+cd "$PBS_O_WORKDIR"
+source /eos-rs/miniconda3/etc/profile.d/conda.sh
+conda activate pila
+export PYTHONPATH="${PYTHONPATH}:$PBS_O_WORKDIR"
+echo "[7dB-beta5] Host: $(hostname)  Env: $CONDA_DEFAULT_ENV  Start: $(date)"
+
+# --- Paths ---
+CONFIG="configs/synth/marapi_mogi_move_loc_iterprior_beta5.json"
+E0="$(find saved/iterprior_marapi_mogi_move_loc/base -name model_best.pth -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
+TRUTH="synthetic/cubes/marapi_mogi_move_loc/marapi_mogi_move_loc_truth.json"
+OUTDIR="saved/iterprior_marapi_mogi_move_loc/beta5_par"
+echo "[7dB-beta5] E0     : $E0"
+echo "[7dB-beta5] out dir: $OUTDIR"
+
+mkdir -p "$OUTDIR"
+python run_iterative_prior_refit.py --config "$CONFIG" --resume "$E0" --settle \
+  --out "$OUTDIR/iterprior_series.csv"
+python plot_iterprior_vs_truth.py --series "$OUTDIR/iterprior_series.csv" \
+  --truth "$TRUTH" --label "iterprior tight, beta=5 (7 dB)" \
+  || echo "[7dB-beta5] WARN plot failed"
+
+echo "[7dB-beta5] DONE: $(date)"

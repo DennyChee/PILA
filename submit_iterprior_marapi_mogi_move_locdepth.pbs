@@ -1,0 +1,60 @@
+#!/bin/bash
+# Usage:       qsub submit_iterprior_marapi_mogi_move_locdepth.pbs
+# Description: Redesigned moving-source test B (MOVE LOCATION + DEPTH). Constant dV=4e7; xcen/
+#              ycen migrate AND depth d ramps 7000->2000. Keeps the Mogi dV-d trade-off live
+#              (and an across-epoch SNR gradient, since deeper epochs are quieter under
+#              peak-referenced noise). Trains base E0 on the pre-generated cube, then the
+#              LOOSE (control) previous-epoch-as-prior refit. Compare vs test A to separate
+#              the trade-off from SNR. See plan swift-bouncing-flurry.
+# Date:        2026-07-07
+#PBS -N iterprior_move_locdepth
+#PBS -P eos_btaisne
+#PBS -q qintel_wfly
+#PBS -l nodes=1:ppn=8
+#PBS -l walltime=12:00:00
+#PBS -l mem=16gb
+#PBS -j oe
+#PBS -o logs/iterprior_move_locdepth_pbs.log
+
+set -e
+cd "$PBS_O_WORKDIR"
+
+# --- Environment (project env is 'pila', NOT base) ---
+source /eos-rs/miniconda3/etc/profile.d/conda.sh
+conda activate pila
+export PYTHONPATH="${PYTHONPATH}:$PBS_O_WORKDIR"
+
+echo "[move_locdepth] Host: $(hostname)  Env: $CONDA_DEFAULT_ENV  Workdir: $PBS_O_WORKDIR"
+echo "[move_locdepth] Start: $(date)"
+
+# --- Named paths (cube already generated; do NOT regenerate -> fixed noise realization) ---
+BASE_CONFIG="configs/synth/marapi_mogi_move_locdepth_base.json"
+ITER_CONFIG="configs/synth/marapi_mogi_move_locdepth_iterprior.json"
+BASE_SAVE_DIR="saved/iterprior_marapi_mogi_move_locdepth/base"
+TRUTH_JSON="synthetic/cubes/marapi_mogi_move_locdepth/marapi_mogi_move_locdepth_truth.json"
+
+# --- Step 1/3: train the base encoder E0 (standard training, KL off) ---
+echo "[move_locdepth] Step 1/3: training base encoder E0..."
+python train_pila.py --config "$BASE_CONFIG"
+
+# --- Step 2/3: locate the freshly-trained base checkpoint (newest model_best.pth) ---
+BASE_CKPT="$(find "$BASE_SAVE_DIR" -name model_best.pth -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
+if [ -z "$BASE_CKPT" ]; then
+  echo "[move_locdepth] ERROR: no base model_best.pth under $BASE_SAVE_DIR" >&2
+  exit 1
+fi
+echo "[move_locdepth] Base checkpoint: $BASE_CKPT"
+
+# --- Step 3/3: LOOSE (control) sequential previous-epoch-as-prior refit over all epochs ---
+echo "[move_locdepth] Step 2/3: sequential prior retraining (LOOSE control)..."
+SERIES_CSV="$BASE_SAVE_DIR/iterprior_series.csv"
+python run_iterative_prior_refit.py \
+  --config "$ITER_CONFIG" \
+  --resume "$BASE_CKPT" \
+  --out "$SERIES_CSV"
+
+echo "[move_locdepth] Step 3/3: plotting recovered vs truth..."
+python plot_iterprior_vs_truth.py --series "$SERIES_CSV" --truth "$TRUTH_JSON" || \
+  echo "[move_locdepth] WARN: plotting failed (series CSV still written)."
+
+echo "[move_locdepth] Finished: $(date)"

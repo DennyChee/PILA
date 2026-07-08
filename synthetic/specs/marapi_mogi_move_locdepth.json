@@ -1,0 +1,19 @@
+{
+  "name": "marapi_mogi_move_locdepth",
+  "model": "mogi",
+  "base_scene": {
+    "timeseries": "synthetic/marapi_grid/base_timeseries.h5",
+    "geometry": "synthetic/marapi_grid/geo_geometryRadar.h5",
+    "mask": "synthetic/marapi_grid/geo_maskTempCoh.h5",
+    "lat0": -0.38,
+    "lon0": 100.47
+  },
+  "trajectory": {
+    "type": "moving",
+    "profiles": { "default": "linear" },
+    "start": { "xcen": -6000.0, "ycen": -4000.0, "d": 7000.0, "dV": 4.0e7 },
+    "end":   { "xcen":  6000.0, "ycen":  4000.0, "d": 2000.0, "dV": 4.0e7 }
+  },
+  "noise": { "type": "marapi", "components": ["combined"], "reference_epoch0": true, "target_snr_db": 7.0 },
+  "paras": "configs/sierranegra_mogi_paras.json"
+}

@@ -1,0 +1,52 @@
+#!/bin/bash
+# Usage:       qsub submit_iterprior_finish_refits.pbs
+# Description: Finish the refit-only experiments that were running on the (expiring) interactive
+#              node: (1) noise-free loose+tight WITH --settle (removes epoch-1 transient from the
+#              bundle figures), (2) 30 dB tight-prior beta sweep beta=2 and beta=5 WITH --settle.
+#              All reuse existing base encoders E0 (no retraining) and auto-plot vs truth.
+# Date:        2026-07-07
+#PBS -N iterprior_finish
+#PBS -P eos_btaisne
+#PBS -q qintel_wfly
+#PBS -l nodes=1:ppn=8
+#PBS -l walltime=12:00:00
+#PBS -l mem=16gb
+#PBS -j oe
+#PBS -o logs/iterprior_finish_refits_pbs.log
+
+set -e
+cd "$PBS_O_WORKDIR"
+source /eos-rs/miniconda3/etc/profile.d/conda.sh
+conda activate pila
+export PYTHONPATH="${PYTHONPATH}:$PBS_O_WORKDIR"
+echo "[finish] Host: $(hostname)  Env: $CONDA_DEFAULT_ENV  Start: $(date)"
+
+CLEAN_E0="$(find saved/iterprior_marapi_mogi_move_loc_clean/base -name model_best.pth -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
+HISNR_E0="$(find saved/iterprior_marapi_mogi_move_loc_hisnr/base -name model_best.pth -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
+CLEAN_TRUTH="synthetic/cubes/marapi_mogi_move_loc_clean/marapi_mogi_move_loc_clean_truth.json"
+HISNR_TRUTH="synthetic/cubes/marapi_mogi_move_loc_hisnr/marapi_mogi_move_loc_hisnr_truth.json"
+echo "[finish] clean E0: $CLEAN_E0"
+echo "[finish] hisnr E0: $HISNR_E0"
+
+refit () {  # $1=config  $2=E0  $3=outdir  $4=truth  $5=label
+  mkdir -p "$3"
+  echo "[finish] --> $3"
+  python run_iterative_prior_refit.py --config "$1" --resume "$2" --settle \
+    --out "$3/iterprior_series.csv"
+  python plot_iterprior_vs_truth.py --series "$3/iterprior_series.csv" \
+    --truth "$4" --label "$5" || echo "[finish] WARN plot failed for $3"
+}
+
+# (1) noise-free loose + tight, settled
+refit configs/synth/marapi_mogi_move_loc_clean_iterprior.json          "$CLEAN_E0" \
+      saved/iterprior_marapi_mogi_move_loc_clean/base_settle     "$CLEAN_TRUTH" "iterprior loose (settled)"
+refit configs/synth/marapi_mogi_move_loc_clean_iterprior_tightloc.json "$CLEAN_E0" \
+      saved/iterprior_marapi_mogi_move_loc_clean/tightloc_settle "$CLEAN_TRUTH" "iterprior tight (settled)"
+
+# (2) 30 dB tight-prior beta sweep, settled
+refit configs/synth/marapi_mogi_move_loc_hisnr_iterprior_beta2.json "$HISNR_E0" \
+      saved/iterprior_marapi_mogi_move_loc_hisnr/beta2 "$HISNR_TRUTH" "iterprior tight, beta=2 (30 dB)"
+refit configs/synth/marapi_mogi_move_loc_hisnr_iterprior_beta5.json "$HISNR_E0" \
+      saved/iterprior_marapi_mogi_move_loc_hisnr/beta5 "$HISNR_TRUTH" "iterprior tight, beta=5 (30 dB)"
+
+echo "[finish] ALL DONE: $(date)"

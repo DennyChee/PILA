@@ -937,10 +937,26 @@ class PHYS_VAE_SMPL(nn.Module):
         # EMA prior configuration
         self.use_ema_prior = config['trainer']['phys_vae'].get('use_ema_prior', False)
         self.ema_momentum = config['trainer']['phys_vae'].get('ema_momentum', 0.99)
-        
+
         # EMA variance bounds (hardcoded)
         self.ema_min_var = 1e-3  # variance floor
         self.ema_max_var = 50.0  # variance ceiling
+
+        # --- Informed-prior configuration (default: disabled) ---
+        # Training-time analogue of the inference-time temporal blend: instead of
+        # blending epoch t with epoch t-1 in u-space at inference, we set the
+        # u_phy KL prior mean to the PREVIOUS epoch's inferred u-space guess and
+        # retrain. The prior VARIANCE is the smoothing strength (small = strong
+        # pull to the previous epoch, i.e. more temporal smoothing; large = weak).
+        # Set at run time by the driver via set_informed_prior(); precedence over
+        # EMA / standard-normal inside priors(). See run_iterative_prior_refit.py.
+        informed_cfg = config['arch']['phys_vae'].get('informed_prior', {})
+        self.use_informed_prior = informed_cfg.get('enabled', False)  # toggled per round by driver
+        # Optional path to an .npz written by the driver holding this round's u-space
+        # prior ('mean' and 'lnvar', each shape (dim_z_phy,)). Loaded after buffers are
+        # registered below. Lets a subprocess training run (train_pila.py -r ...) pick
+        # up the previous epoch's guess without an in-process set_informed_prior() call.
+        self._informed_prior_path = informed_cfg.get('prior_path', None)
 
         # Encoding part
         self.enc = Encoders(config)
@@ -956,6 +972,19 @@ class PHYS_VAE_SMPL(nn.Module):
             self.register_buffer('ema_mean', torch.zeros(self.dim_z_phy))  # E[U]
             self.register_buffer('ema_m2', torch.ones(self.dim_z_phy))     # E[U^2]
             self.register_buffer('ema_var', torch.ones(self.dim_z_phy))    # convenience buffer
+
+        # Informed-prior buffers for u_phy (per-round mean/lnvar in u-space).
+        # Registered NON-PERSISTENT so they never enter/expect state_dict: existing
+        # checkpoints load unchanged, and the driver re-seeds them each round rather
+        # than restoring them from disk. Only meaningful when physics is active.
+        if not self.no_phy:
+            # Default = standard normal N(0, 1) in u-space, so an accidentally-enabled
+            # flag without a set_informed_prior() call is a harmless uninformed prior.
+            self.register_buffer('informed_prior_mean', torch.zeros(self.dim_z_phy), persistent=False)
+            self.register_buffer('informed_prior_lnvar', torch.zeros(self.dim_z_phy), persistent=False)
+            # If a prior file was configured, load it now (subprocess training path).
+            if self.use_informed_prior and self._informed_prior_path is not None:
+                self._load_informed_prior_from_file(self._informed_prior_path)
         
         # Store time features for decoder use
         self.time_feats = None
@@ -989,15 +1018,54 @@ class PHYS_VAE_SMPL(nn.Module):
         y = self.physics_model(z_phy, const=const) # (n, in_channels) 
         return y
 
+    def _load_informed_prior_from_file(self, prior_path: str):
+        """
+        Load a round's u-space informed prior ('mean', 'lnvar') from an .npz and
+        activate it. Used by the subprocess training path (the driver writes the
+        .npz; the model reads it at construction). Missing file is a hard error so
+        a mis-wired round cannot silently fall back to N(0, 1).
+        """
+        if not os.path.exists(prior_path):
+            raise FileNotFoundError(f"informed_prior.prior_path not found: {prior_path}")
+        blob = np.load(prior_path)
+        mean = torch.as_tensor(blob['mean'], dtype=torch.float32)
+        lnvar = torch.as_tensor(blob['lnvar'], dtype=torch.float32)
+        self.set_informed_prior(mean, lnvar)
+
+    def set_informed_prior(self, u_phy_mean: torch.Tensor, u_phy_lnvar: torch.Tensor):
+        """
+        Seed the informed u_phy prior for one retraining round and activate it.
+
+        The prior mean is the PREVIOUS epoch's inferred u-space guess; the prior
+        variance sets the temporal-smoothing strength (see priors()). Called once
+        per round by run_iterative_prior_refit.py before training resumes.
+
+        Args:
+            u_phy_mean:  previous epoch's u-space mean, shape (dim_z_phy,) or (1, dim_z_phy)
+            u_phy_lnvar: prior log-variance in u-space, same shape. Smaller lnvar =>
+                         tighter pull toward u_phy_mean => more temporal smoothing.
+        """
+        if self.no_phy:
+            return
+        with torch.no_grad():
+            # Flatten any leading batch dim to a per-parameter vector (dim_z_phy,)
+            mean_vec = u_phy_mean.detach().reshape(-1)
+            lnvar_vec = u_phy_lnvar.detach().reshape(-1)
+            self.informed_prior_mean.copy_(mean_vec.to(self.informed_prior_mean))
+            self.informed_prior_lnvar.copy_(lnvar_vec.to(self.informed_prior_lnvar))
+        self.use_informed_prior = True  # take precedence over EMA / standard-normal in priors()
+
     def update_ema_prior(self, u_phy_mean: torch.Tensor, u_phy_lnvar: torch.Tensor):
         """
         Update EMA statistics for u_phy using exponential moving average.
-        
+
         Args:
             u_phy_mean: Current batch posterior means (shape: [batch_size, dim_z_phy])
             u_phy_lnvar: Current batch posterior log-variances (shape: [batch_size, dim_z_phy])
         """
-        if not self.use_ema_prior or self.no_phy:
+        # Freeze EMA updates while an informed prior is active: the round's prior
+        # must stay fixed at the previous epoch's guess, not drift with the batch.
+        if not self.use_ema_prior or self.no_phy or self.use_informed_prior:
             return
             
         with torch.no_grad():
@@ -1024,7 +1092,14 @@ class PHYS_VAE_SMPL(nn.Module):
         CHANGED: priors now in u-space for physics (standard normal or EMA Gaussian),
         auxiliaries remain standard normal as before.
         """
-        if self.use_ema_prior and not self.no_phy:
+        if self.use_informed_prior and not self.no_phy:
+            # Informed Gaussian prior in u-space (previous epoch's guess). Precedence
+            # over EMA / standard-normal. Buffers are (dim_z_phy,); broadcast to n.
+            prior_u_phy_stat = {
+                'mean': self.informed_prior_mean.to(device).unsqueeze(0).expand(n, -1),
+                'lnvar': self.informed_prior_lnvar.to(device).unsqueeze(0).expand(n, -1)
+            }
+        elif self.use_ema_prior and not self.no_phy:
             # Use EMA Gaussian prior for u_phy
             ema_var = (self.ema_m2 - self.ema_mean**2).clamp(self.ema_min_var, self.ema_max_var)
             prior_u_phy_stat = {

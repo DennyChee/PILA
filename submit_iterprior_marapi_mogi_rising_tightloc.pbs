@@ -1,0 +1,56 @@
+#!/bin/bash
+# Usage:       qsub submit_iterprior_marapi_mogi_rising_tightloc.pbs
+# Description: Iterative previous-epoch-as-prior retraining on the rising Mogi cube, but
+#              with a TIGHT location prior (loc_std=0.2 vs the default 1.0) so the
+#              informed prior actually couples xcen/ycen/d to the previous epoch. Reuses
+#              the EXISTING base checkpoint E0 from the original run (no re-train), so
+#              this isolates the single change (prior width) for a clean A-vs-B compare.
+# Date:        2026-07-02
+#PBS -N iterprior_mogi_tightloc
+#PBS -P eos_btaisne
+#PBS -q qintel_wfly
+#PBS -l nodes=1:ppn=8
+#PBS -l walltime=12:00:00
+#PBS -l mem=16gb
+#PBS -j oe
+#PBS -o logs/iterprior_mogi_tightloc_pbs.log
+
+set -e
+cd "$PBS_O_WORKDIR"
+
+# --- Environment (project env is 'pila', NOT base) ---
+source /eos-rs/miniconda3/etc/profile.d/conda.sh
+conda activate pila
+export PYTHONPATH="${PYTHONPATH}:$PBS_O_WORKDIR"
+
+echo "[tightloc] Host: $(hostname)  Env: $CONDA_DEFAULT_ENV  Workdir: $PBS_O_WORKDIR"
+echo "[tightloc] Start: $(date)"
+
+# --- Named paths ---
+ITER_CONFIG="configs/synth/marapi_mogi_rising_iterprior_tightloc.json"
+OUT_DIR="saved/iterprior_marapi_mogi_rising/tightloc"
+# Reuse the base encoder E0 from the original run (identical starting point).
+BASE_CKPT="saved/iterprior_marapi_mogi_rising/base/marapi_mogi_rising_base/0701_192124/models/model_best.pth"
+TRUTH_JSON="synthetic/cubes/marapi_mogi_rising_combined/marapi_mogi_rising_combined_truth.json"
+
+if [ ! -f "$BASE_CKPT" ]; then
+  echo "[tightloc] ERROR: base checkpoint not found: $BASE_CKPT" >&2
+  exit 1
+fi
+mkdir -p "$OUT_DIR"
+echo "[tightloc] Base checkpoint: $BASE_CKPT"
+
+# --- Sequential prior retraining (all 76 epochs) with the tight location prior ---
+echo "[tightloc] Step 1/2: sequential prior retraining (loc_std=0.2)..."
+SERIES_CSV="$OUT_DIR/iterprior_series.csv"
+python run_iterative_prior_refit.py \
+  --config "$ITER_CONFIG" \
+  --resume "$BASE_CKPT" \
+  --out "$SERIES_CSV"
+
+# --- Comparison plot vs truth (same style as the base run) ---
+echo "[tightloc] Step 2/2: plotting recovered vs truth..."
+python plot_iterprior_vs_truth.py --series "$SERIES_CSV" --truth "$TRUTH_JSON" || \
+  echo "[tightloc] WARN: plotting failed (series CSV still written)."
+
+echo "[tightloc] Finished: $(date)"

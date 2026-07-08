@@ -1,0 +1,40 @@
+#!/bin/bash
+# Usage:       qsub submit_iterprior_beta5_par.pbs
+# Description: Parallel (standalone) 30 dB tight-prior beta=5 refit, run WITH --settle,
+#              reusing the existing hisnr base encoder E0 (no retraining). Split out of the
+#              sequential submit_iterprior_finish_refits.pbs so the beta sweep runs concurrently.
+#              Writes to a DEDICATED dir (beta5_par) so it never overlaps 3713142's own eventual
+#              beta5/ output. Auto-plots vs truth.
+# Date:        2026-07-07
+#PBS -N iterprior_beta5
+#PBS -P eos_btaisne
+#PBS -q qintel_wfly
+#PBS -l nodes=1:ppn=8
+#PBS -l walltime=12:00:00
+#PBS -l mem=16gb
+#PBS -j oe
+#PBS -o logs/iterprior_beta5_par_pbs.log
+
+set -e
+cd "$PBS_O_WORKDIR"
+source /eos-rs/miniconda3/etc/profile.d/conda.sh
+conda activate pila
+export PYTHONPATH="${PYTHONPATH}:$PBS_O_WORKDIR"
+echo "[beta5] Host: $(hostname)  Env: $CONDA_DEFAULT_ENV  Start: $(date)"
+
+# --- Paths (named up top per house style) ---
+CONFIG="configs/synth/marapi_mogi_move_loc_hisnr_iterprior_beta5.json"
+HISNR_E0="$(find saved/iterprior_marapi_mogi_move_loc_hisnr/base -name model_best.pth -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
+HISNR_TRUTH="synthetic/cubes/marapi_mogi_move_loc_hisnr/marapi_mogi_move_loc_hisnr_truth.json"
+OUTDIR="saved/iterprior_marapi_mogi_move_loc_hisnr/beta5_par"   # dedicated: no overlap with beta5/
+echo "[beta5] hisnr E0: $HISNR_E0"
+echo "[beta5] out dir : $OUTDIR"
+
+mkdir -p "$OUTDIR"
+python run_iterative_prior_refit.py --config "$CONFIG" --resume "$HISNR_E0" --settle \
+  --out "$OUTDIR/iterprior_series.csv"
+python plot_iterprior_vs_truth.py --series "$OUTDIR/iterprior_series.csv" \
+  --truth "$HISNR_TRUTH" --label "iterprior tight, beta=5 (30 dB)" \
+  || echo "[beta5] WARN plot failed"
+
+echo "[beta5] DONE: $(date)"
