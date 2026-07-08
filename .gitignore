@@ -170,6 +170,8 @@ uq_jobs*/
 multistart_jobs*/
 definitive_jobs*/
 submit_replot/
+iterprior_move_results/
+figures/presentation_single_date/
 
 # --- Synthetic data & heavy outputs (keep generation code, drop data) ---
 synthetic/cubes/
