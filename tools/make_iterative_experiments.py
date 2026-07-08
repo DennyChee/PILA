@@ -65,7 +65,7 @@ VOLCANO_ABBR = {
 # Resources/queue/project copied from the curated InSAR submit scripts. Adjust on the HPC
 # if a given run needs more walltime/memory.
 PBS_TEMPLATE = """#!/bin/bash
-# Usage:       qsub {pbs_name}
+# Usage:       qsub jobs/{pbs_name}
 # Description: Submit the PILA iterative-refinement training job for experiment
 #              "{base}". Identical to the baseline run except the encoder iteratively
 #              refines its source-parameter estimate (arch.phys_vae.iterative_refinement).
@@ -152,7 +152,7 @@ def main():
     n = len(BASE_EXPERIMENTS)
     print(f"[1/3] Generating iterative variants for {n} base experiments")
     print(f"  config dir : {CONFIG_DIR}")
-    print(f"  pbs dir    : {REPO_ROOT}")
+    print(f"  pbs dir    : {os.path.join(REPO_ROOT, 'jobs')}")
     print(f"  dry-run    : {args.dry_run}")
 
     written_configs, written_pbs, missing = [], [], []
@@ -172,9 +172,10 @@ def main():
         iter_cfg = build_iterative_config(base_cfg)
         iter_cfg_path = os.path.join(CONFIG_DIR, f"{stem}_iterative.json")
 
-        # --- Build the matching PBS submit script ---
+        # --- Build the matching PBS submit script (written under jobs/) ---
         pbs_name = f"submit_{stem}_iterative.pbs"
-        pbs_path = os.path.join(REPO_ROOT, pbs_name)
+        os.makedirs(os.path.join(REPO_ROOT, "jobs"), exist_ok=True)
+        pbs_path = os.path.join(REPO_ROOT, "jobs", pbs_name)
         pbs_text = PBS_TEMPLATE.format(base=stem, pbs_name=pbs_name, job_name=make_job_name(stem))
 
         if args.dry_run:

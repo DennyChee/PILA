@@ -216,7 +216,7 @@ def build_pbs(volcano, vinfo, track_label, model, config_name):
     """Build one PBS submit script string for (volcano, track, model)."""
     job = f"{vinfo['abbr']}_{model}_{track_label}"        # short PBS -N (<=15 chars)
     return f"""#!/bin/bash
-# Usage:       qsub submit_{config_name.lower()}.pbs
+# Usage:       qsub jobs/submit_{config_name.lower()}.pbs
 # Description: Submit the PILA {volcano} {model} InSAR (Stage A, MLP) training job to PBS,
 #              track {track_label}. Trains the physics-VAE on the whole MintPy LOS time
 #              series (each epoch an independent sample) to invert for the {model} source.
@@ -285,10 +285,12 @@ def main():
             for model, minfo in MODELS.items():
                 name = f"{volcano}_{model}_{track_label}_A"
                 pbs = build_pbs(volcano, vinfo, track_label, model, name)
-                pbs_path = os.path.join(REPO_ROOT, f"submit_{name.lower()}.pbs")
+                jobs_dir = os.path.join(REPO_ROOT, "jobs")
+                os.makedirs(jobs_dir, exist_ok=True)
+                pbs_path = os.path.join(jobs_dir, f"submit_{name.lower()}.pbs")
                 with open(pbs_path, "w") as fh:
                     fh.write(pbs)
-                submit_cmds.append(f"qsub submit_{name.lower()}.pbs")
+                submit_cmds.append(f"qsub jobs/submit_{name.lower()}.pbs")
                 n_pbs += 1
     print(f"  Wrote {n_pbs} PBS scripts.")
 
