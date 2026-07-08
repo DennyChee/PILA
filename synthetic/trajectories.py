@@ -148,12 +148,16 @@ def static_buildup(model_name, n_epochs, geometry, amplitude_key,
 
 
 # --- Bounds check against a PILA *_paras.json -------------------------------
-def to_paras_value(model_name, param_name, value_si):
+def to_paras_value(model_name, param_name, value_si, dv_scale=1e5, dv_shift=-1e7):
     """
     Convert a physical SI parameter value to its PILA *_paras.json (z) value.
 
     Inverse of model_phys_smpl rescale(): km-distance params are divided by 1000;
-    dV uses dV_paras = (dV_si + 1e7) / 1e5; angles/opening are unchanged.
+    dV uses dV_paras = (dV_si - dv_shift) / dv_scale; angles/opening are unchanged.
+
+    dv_scale / dv_shift default to the legacy Mogi/Sun69 map (1e5, -1e7). Pass the
+    'scale'/'shift' from the paras-JSON dV entry to match a custom mapping (e.g. the
+    symmetric-about-0 range in configs/mogi_paras_symdV.json, scale=1, shift=0).
     """
     km_params = {
         'mogi':  ['xcen', 'ycen', 'd'],
@@ -161,7 +165,7 @@ def to_paras_value(model_name, param_name, value_si):
         'okada': ['xoff', 'yoff', 'depth', 'length', 'width'],
     }[model_name]
     if param_name == 'dV':
-        return (value_si + 1e7) / 1e5             # rescale(): dV_si = z*1e5 - 1e7
+        return (value_si - dv_shift) / dv_scale   # rescale(): dV_si = z*dv_scale + dv_shift
     if param_name in km_params:
         return value_si / 1000.0                  # m -> km
     return value_si                               # strike/dip (deg), opening (m)
@@ -195,7 +199,11 @@ def check_within_bounds(model_name, param_names, params_per_epoch, paras_ranges,
             continue
         lo = paras_ranges[name]['min']
         hi = paras_ranges[name]['max']
-        z = np.array([to_paras_value(model_name, name, v) for v in params_per_epoch[:, j]])
+        # dV entry may carry a custom affine ('scale'/'shift'); default to legacy map.
+        dv_scale = float(paras_ranges[name].get('scale', 1e5))
+        dv_shift = float(paras_ranges[name].get('shift', -1e7))
+        z = np.array([to_paras_value(model_name, name, v, dv_scale, dv_shift)
+                      for v in params_per_epoch[:, j]])
         if np.any(z < lo - margin) or np.any(z > hi + margin):
             violations.append(
                 f"'{name}': paras-value range [{z.min():.4g}, {z.max():.4g}] "

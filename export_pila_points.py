@@ -63,12 +63,20 @@ CLASSICAL_PARAMS = {
 PARAS_KEY = {'mogi': 'mogi_paras', 'okada': 'okada_paras', 'sun69': 'sun69_paras'}
 
 
-def _transform_bound(value, kind):
-    """Map a PILA paras-JSON bound to the physical SI unit the MATLAB model uses."""
+def _transform_bound(value, kind, rng=None):
+    """Map a PILA paras-JSON bound to the physical SI unit the MATLAB model uses.
+
+    For dV the affine is physical = value*scale + shift; scale/shift come from the
+    paras-JSON dV entry (`rng`) and default to the legacy map (1e5, -1e7). This keeps
+    the classical search box identical to PILA's decoder for any dV parameterization
+    (e.g. the symmetric-about-0 range in configs/mogi_paras_symdV.json).
+    """
     if kind == 'km':
         return value * 1000.0          # km -> m
     if kind == 'dV':
-        return value * 1e5 - 1e7       # PILA dV magnitude transform -> m^3
+        dv_scale = float((rng or {}).get('scale', 1e5))
+        dv_shift = float((rng or {}).get('shift', -1e7))
+        return value * dv_scale + dv_shift   # PILA dV magnitude transform -> m^3
     return value                       # 'deg' / 'm' : unchanged
 
 
@@ -82,8 +90,8 @@ def build_classical_bounds(model, paras):
     for mat_name, json_key, kind in CLASSICAL_PARAMS[model]:
         rng = paras[json_key]
         names.append(mat_name)
-        lo.append(_transform_bound(rng['min'], kind))
-        hi.append(_transform_bound(rng['max'], kind))
+        lo.append(_transform_bound(rng['min'], kind, rng))
+        hi.append(_transform_bound(rng['max'], kind, rng))
     return np.array([lo, hi], dtype=np.float64), names
 
 

@@ -248,8 +248,11 @@ encoder infers `z_phy` → physics decoder renders LOS → (masked) MSE → back
    Okada share the same scaler for a given scene/grid.
 7. **Parameter ranges** in `sierranegra_*_paras.json` are **best-effort placeholders**.
    They define the physical search space; tune them to Sierra Negra after first runs.
-   (Mogi `dV` is mapped internally as `dV_phys = dV·1e5 − 1e7` m³; Okada `xoff/yoff/depth/
-   length/width` are in km, `opening` in m, angles in deg.)
+   (Mogi `dV` is mapped internally as `dV_phys = dV·scale + shift` m³, defaulting to
+   `scale=1e5, shift=−1e7` when the paras JSON omits them; a paras file may set `scale`/
+   `shift` to define a custom range — e.g. `configs/mogi_paras_symdV.json` uses a range
+   symmetric about 0 so `dV=0` is reachable. Okada `xoff/yoff/depth/length/width` are in km,
+   `opening` in m, angles in deg.)
 
 ---
 

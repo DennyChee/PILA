@@ -341,9 +341,16 @@ class Physics_Mogi(nn.Module):
             if para_name in ['xcen', 'ycen', 'd']:
                 z_phy_rescaled[para_name] = z_phy_rescaled[para_name]*1000
 
-        z_phy_rescaled['dV'] = z_phy_rescaled['dV'] * \
-            torch.pow(10, torch.tensor(5)) - torch.pow(10, torch.tensor(7))
-        
+        # dV magnitude transform: physical dV = (rescaled dV) * dV_scale + dV_shift.
+        # Defaults (dV_scale=1e5, dV_shift=-1e7) reproduce the legacy hardcoded map, so
+        # existing paras files and checkpoints are unchanged. A paras file may set
+        # 'scale'/'shift' on the dV entry to define a different physical range -- e.g.
+        # configs/mogi_paras_symdV.json uses min=-2e8, max=2e8, scale=1, shift=0 to make
+        # a symmetric-about-0 range where z=0.5 (u=0, the prior mean) maps to dV=0 m^3.
+        dV_scale = float(self.z_phy_ranges['dV'].get('scale', 1e5))
+        dV_shift = float(self.z_phy_ranges['dV'].get('shift', -1e7))
+        z_phy_rescaled['dV'] = z_phy_rescaled['dV'] * dV_scale + dV_shift
+
         return z_phy_rescaled
     
     def forward(self, z_phy:torch.Tensor, const:dict=None):
@@ -412,10 +419,15 @@ class Physics_Sun69(nn.Module):
 
             z_phy_rescaled[para_name] = val
 
-        # Volume change uses the same magnitude transform as Mogi's dV so the two
-        # sources share parameterization conventions (confirm bounds per scene).
-        z_phy_rescaled['dV'] = z_phy_rescaled['dV'] * \
-            torch.pow(10, torch.tensor(5)) - torch.pow(10, torch.tensor(7))
+        # Volume change uses the same data-driven magnitude transform as Mogi's dV so
+        # the two sources share parameterization conventions:
+        #   physical dV = (rescaled dV) * dV_scale + dV_shift.
+        # Defaults (dV_scale=1e5, dV_shift=-1e7) reproduce the legacy hardcoded map; a
+        # paras file may set 'scale'/'shift' on the dV entry for a symmetric-about-0
+        # range (see Physics_Mogi.rescale and configs/mogi_paras_symdV.json).
+        dV_scale = float(self.z_phy_ranges['dV'].get('scale', 1e5))
+        dV_shift = float(self.z_phy_ranges['dV'].get('shift', -1e7))
+        z_phy_rescaled['dV'] = z_phy_rescaled['dV'] * dV_scale + dV_shift
 
         return z_phy_rescaled
 

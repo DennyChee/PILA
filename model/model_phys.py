@@ -168,10 +168,14 @@ class Physics_Mogi(nn.Module):
             if para_name in ['xcen', 'ycen', 'd']:
                 z_phy_rescaled[para_name] = z_phy_rescaled[para_name]*1000
 
-        z_phy_rescaled['dV'] = z_phy_rescaled['dV'] * \
-            torch.pow(10, torch.tensor(5)) - torch.pow(10, torch.tensor(7))
+        # dV magnitude transform: physical dV = (rescaled dV) * dV_scale + dV_shift.
+        # Kept consistent with model_phys_smpl.py's Physics_Mogi.rescale so the legacy
+        # HVAE baseline and the PILA decoder agree. Defaults (1e5, -1e7) reproduce the old
+        # hardcoded map; a paras file may set 'scale'/'shift' (e.g. mogi_paras_symdV.json).
+        dV_scale = float(self.z_phy_ranges['dV'].get('scale', 1e5))
+        dV_shift = float(self.z_phy_ranges['dV'].get('shift', -1e7))
+        z_phy_rescaled['dV'] = z_phy_rescaled['dV'] * dV_scale + dV_shift
 
-        
         return z_phy_rescaled
     
     def forward(self, z_phy:torch.Tensor, const:dict=None):

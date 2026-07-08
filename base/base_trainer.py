@@ -4,6 +4,41 @@ from numpy import inf
 from logger import TensorboardWriter
 from base import PARENT_DIR
 import os
+import json
+
+
+def _resolve_dv_physical_endpoints(config):
+    """
+    Resolve the physical dV values at the latent extremes (z=0 and z=1) implied by a
+    config's Mogi/Sun69 paras JSON, i.e. the actual dV physical mapping the decoder uses:
+        dV_phys(z) = (z*(max-min)+min) * scale + shift   (scale/shift default 1e5/-1e7)
+    Returns (dV_at_z0, dV_at_z1) rounded to drop float noise, or None if the physics has
+    no dV parameter (e.g. Okada) or the paras file can't be read. Comparing the resulting
+    endpoints (not the raw min/max/scale/shift) means two equivalent reparameterizations
+    of the SAME linear map are treated as equal. Used to guard resume against a silent dV
+    mapping change (see model/model_phys_smpl.py Physics_Mogi.rescale).
+    """
+    try:
+        args = config['arch']['args']
+    except (KeyError, TypeError):
+        return None
+    paras_path = next((args[k] for k in ('mogi_paras', 'sun69_paras') if k in args), None)
+    if paras_path is None:
+        return None
+    full = os.path.join(PARENT_DIR, paras_path)
+    if not os.path.exists(full):
+        return None
+    with open(full) as fh:
+        ranges = json.load(fh)
+    dv = ranges.get('dV')
+    if dv is None:
+        return None
+    minv, maxv = float(dv['min']), float(dv['max'])
+    scale = float(dv.get('scale', 1e5))
+    shift = float(dv.get('shift', -1e7))
+    dv_z0 = minv * scale + shift
+    dv_z1 = maxv * scale + shift
+    return (round(dv_z0, 3), round(dv_z1, 3))
 
 
 class BaseTrainer:
@@ -174,6 +209,24 @@ class BaseTrainer:
         if checkpoint['config']['arch'] != self.config['arch']:
             self.logger.warning("Warning: Architecture configuration given in config file is different from that of "
                                 "checkpoint. This may yield an exception while state_dict is being loaded.")
+
+        # Guard: refuse to resume if the dV physical mapping differs from the checkpoint's.
+        # The encoder's u-space is calibrated to the dV affine active at TRAINING time; a
+        # checkpoint trained under one mapping (e.g. legacy 1e5/-1e7) resumed under another
+        # (e.g. configs/mogi_paras_symdV.json, symmetric about 0) silently reinterprets the
+        # same learned latent as a very different physical volume -- no shape mismatch, no
+        # error, just wrong physics. Compare the resulting z=0/z=1 endpoints and fail loudly.
+        ckpt_dv = _resolve_dv_physical_endpoints(checkpoint['config'])
+        cur_dv = _resolve_dv_physical_endpoints(self.config)
+        if ckpt_dv is not None and cur_dv is not None and ckpt_dv != cur_dv:
+            raise ValueError(
+                "Refusing to resume: the dV physical mapping differs between the checkpoint "
+                f"and the current config. Checkpoint dV endpoints (z=0, z=1) = {ckpt_dv} m^3; "
+                f"current config = {cur_dv} m^3. The encoder u-space is calibrated to the "
+                "training-time mapping, so resuming under a different one corrupts recovered "
+                "volumes. Retrain from scratch, or point --config at a paras file whose dV "
+                "affine matches the checkpoint.")
+
         self.model.load_state_dict(checkpoint['state_dict'])
 
         # load optimizer state from checkpoint only when optimizer type is not changed.

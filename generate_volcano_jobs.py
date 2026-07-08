@@ -66,11 +66,15 @@ MODELS = {
 
 # --- Source-parameter prior ranges (reused from SierraNegra; km / deg / Mm^3 etc.) ---
 PARAS = {
-    # NOTE: dV here is the PRE-transform range. The decoder applies a hardcoded affine
-    # map dV_physical = dV_prior*1e5 - 1e7 (model_phys_smpl.py rescale), so the range
+    # NOTE: dV here is the PRE-transform range. The decoder applies a per-parameter affine
+    # map dV_physical = dV_prior*scale + shift (model_phys_smpl.py rescale), which DEFAULTS
+    # to scale=1e5, shift=-1e7 when the paras entry omits them (as it does here). So this
     # [-2000, 4000] -> physical [-210e6, +390e6] m^3 (deflation AND inflation headroom).
     # The previous [0, 2000] mapped to [-10e6, +190e6] m^3, which railed: deflating
     # volcanoes pinned at the -10e6 floor and Nyiragongo's +172e6 neared the ceiling.
+    # (A paras file may instead set explicit 'scale'/'shift' to define a different range,
+    # e.g. the symmetric-about-0 configs/mogi_paras_symdV.json used by the synthetic
+    # moving-Mogi experiments; that path is unaffected by these defaults.)
     "Mogi": {
         "xcen": {"min": -15, "max": 15},
         "ycen": {"min": -15, "max": 15},

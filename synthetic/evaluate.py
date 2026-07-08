@@ -25,7 +25,9 @@
 #   * Recovery is meaningful only on strong-signal epochs: at near-zero deformation
 #     (early cumulative epochs) the source parameters are unconstrained, so we
 #     headline the PEAK epoch and a strong-signal subset, and also report all epochs.
-#   * dV convention matches PILA rescale(): physical dV_si = z*1e5 - 1e7.
+#   * dV convention matches PILA rescale(): physical dV_si = z_scaled*scale + shift,
+#     defaulting to scale=1e5, shift=-1e7 (legacy) unless the paras JSON overrides them
+#     (e.g. configs/mogi_paras_symdV.json uses a range symmetric about 0).
 # Date:        2026-06-22
 
 import argparse

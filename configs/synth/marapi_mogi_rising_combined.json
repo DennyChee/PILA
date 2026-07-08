@@ -10,7 +10,7 @@
             "hidden_dim": 8,
             "time_feat_dim": 4,
             "use_time_in_residual": false,
-            "mogi_paras": "configs/sierranegra_mogi_paras.json",
+            "mogi_paras": "configs/mogi_paras_symdV.json",
             "insar": {
                 "timeseries": "/eos-rs/INSAR_processing/denny/PILA/synthetic/cubes/marapi_mogi_rising_combined/marapi_mogi_rising_combined.h5",
                 "geometry": "synthetic/marapi_grid/geo_geometryRadar.h5",
