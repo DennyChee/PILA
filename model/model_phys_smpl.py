@@ -582,7 +582,8 @@ def _load_insar_inputs(config:dict):
             standardization=ins.get('std_mode', 'global'), far_field=ins.get('far_field'),
             stride=ins.get('stride', 1), offset=ins.get('offset', 0),   # UQ decimation (must match dataset)
             bootstrap_k=ins.get('bootstrap_k'), bootstrap_block=ins.get('bootstrap_block', 3),
-            bootstrap_seed=ins.get('bootstrap_seed', 0))
+            bootstrap_seed=ins.get('bootstrap_seed', 0),
+            ref_date=ins.get('ref_date'))          # temporal re-referencing (must match dataset)
         x_east_m = torch.tensor(d.xE_pts.astype(np.float32)) * 1000.0   # km -> m
         y_north_m = torch.tensor(d.yN_pts.astype(np.float32)) * 1000.0
         los_E = torch.tensor(d.losE_pts[None, :]).float().to(DEVICE)
@@ -632,7 +633,8 @@ def _load_insar_grid_inputs(config:dict):
         standardization=ins.get('std_mode', 'global'), far_field=ins.get('far_field'),
         stride=ins.get('stride', 1), offset=ins.get('offset', 0),   # UQ decimation (grid path)
         bootstrap_k=ins.get('bootstrap_k'), bootstrap_block=ins.get('bootstrap_block', 3),
-        bootstrap_seed=ins.get('bootstrap_seed', 0))
+        bootstrap_seed=ins.get('bootstrap_seed', 0),
+        ref_date=ins.get('ref_date'))          # temporal re-referencing (must match dataset)
     Hd, Wd = d.mask_d.shape
     # CRITICAL: cell order here MUST match how the trainer flattens the input image
     # (torch `data.reshape(B, -1)`, i.e. C-order/row-major over Hd x Wd). flat() forces
@@ -891,7 +893,8 @@ def _maybe_set_insar_input_dim(config:dict):
         standardization=ins.get('std_mode', 'global'), far_field=ins.get('far_field'),
         stride=ins.get('stride', 1), offset=ins.get('offset', 0),   # UQ decimation -> input_dim = N/stride
         bootstrap_k=ins.get('bootstrap_k'), bootstrap_block=ins.get('bootstrap_block', 3),
-        bootstrap_seed=ins.get('bootstrap_seed', 0))
+        bootstrap_seed=ins.get('bootstrap_seed', 0),
+        ref_date=ins.get('ref_date'))          # temporal re-referencing (must match dataset)
     # CNN path renders the whole Hd x Wd grid -> input_dim = Hd*Wd (flattened image);
     # point/MLP path uses the N coherent cells -> input_dim = N.
     if args.get('encoder_type', 'mlp') == 'cnn':

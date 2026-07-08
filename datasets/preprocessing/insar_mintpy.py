@@ -14,8 +14,14 @@
 #   * LOS sign: positive LOS = motion TOWARD the satellite (range decrease), MintPy
 #     convention. Per-cell LOS unit vectors are derived through MintPy's enu2los so the
 #     model-side projection e_E*uE + e_N*uN + e_U*uU is sign-consistent.
-#   * Referencing: KEPT AS MintPy PRODUCED IT (its REF_DATE / REF pixel). No extra
-#     re-referencing is applied here.
+#   * Referencing: by default KEPT AS MintPy PRODUCED IT (its REF_DATE / REF pixel).
+#     OPTIONAL: pass `ref_date` to TEMPORALLY re-reference the stack — the chosen epoch's
+#     per-pixel field is subtracted from every epoch (so it becomes identically zero and
+#     displacement is measured from that date onward). Spatial (REF pixel) referencing is
+#     unchanged. Note: the zeroed ref epoch is still included in the per-point / global
+#     standardization stats, biasing mean/std slightly low (~1/n_epoch); the effect is
+#     larger for a mid-series ref_date on a small stack. Re-referencing to a low-coherence
+#     epoch can also shrink the coherent-pixel count (that epoch's NaNs propagate).
 #   * Local ENU origin (lat0, lon0): the fixed frame peg mapping to (xE, yN) = (0, 0) km.
 #     It is NOT the source location — the source (xcen/ycen, xoff/yoff) is inverted and
 #     reported relative to this peg. It MUST match the origin used to define the
@@ -254,7 +260,8 @@ def load_insar_mintpy(timeseries_h5, geometry_h5, mask_h5, lat0, lon0,
                       multilook=1, coh_valid_frac=0.5, bbox=None, verbose=True,
                       standardization='global', far_field=None,
                       stride=1, offset=0,
-                      bootstrap_k=None, bootstrap_block=3, bootstrap_seed=0):
+                      bootstrap_k=None, bootstrap_block=3, bootstrap_seed=0,
+                      ref_date=None):
     """
     Load + multilook a MintPy LOS time series into an InSARData bundle (memoized).
 
@@ -288,6 +295,14 @@ def load_insar_mintpy(timeseries_h5, geometry_h5, mask_h5, lat0, lon0,
                      isolate one target (e.g. Bali/Agung) so unrelated deformation elsewhere
                      in the scene (e.g. the 2018 Lombok earthquakes) cannot contaminate the
                      single-source inversion.
+    ref_date       : str or None. TEMPORAL re-referencing. MintPy delivers the cube relative
+                     to its own REF_DATE (epoch 0, identically zero). If given (accepts
+                     'YYYY-MM-DD' or 'YYYYMMDD'), subtract that epoch's per-pixel LOS field
+                     from EVERY epoch, so displacement is measured relative to `ref_date`
+                     instead. The chosen epoch becomes identically zero. This is a per-pixel
+                     (spatial-field) subtraction done at full resolution BEFORE masking/
+                     multilooking, so it commutes exactly with the mask-aware block average.
+                     DEFAULT None = keep MintPy's referencing unchanged (no behaviour change).
 
     Returns
     -------
@@ -338,7 +353,8 @@ def load_insar_mintpy(timeseries_h5, geometry_h5, mask_h5, lat0, lon0,
                  int(multilook), float(coh_valid_frac), bbox_key,
                  str(standardization), ff_key, stride, offset,
                  bootstrap_k, bootstrap_block if bootstrap_k is not None else None,
-                 bootstrap_seed if bootstrap_k is not None else None)
+                 bootstrap_seed if bootstrap_k is not None else None,
+                 str(ref_date) if ref_date is not None else None)
     if cache_key in _CACHE:
         return _CACHE[cache_key]
 
@@ -355,6 +371,26 @@ def load_insar_mintpy(timeseries_h5, geometry_h5, mask_h5, lat0, lon0,
     n_epoch, full_rows, full_cols = ts_cube_m.shape
     if verbose:
         print(f"  Loaded: shape={ts_cube_m.shape}, dtype={ts_cube_m.dtype}, n_epoch={n_epoch}")
+
+    # --- Optional TEMPORAL re-referencing to a chosen epoch --------------------
+    # MintPy hands us the cube relative to its own REF_DATE (epoch 0 == 0). If the caller
+    # asks for a different `ref_date`, subtract that epoch's full-resolution LOS field from
+    # every epoch so displacement is measured from ref_date onward. Done at full res, before
+    # any crop/mask/multilook, so it commutes with the (linear) mask-aware block average.
+    if ref_date is not None:
+        # Normalise both the requested date and the file's dates to 'YYYYMMDD' for matching.
+        # `dates` are already ISO 'YYYY-MM-DD' strings (from date_bytes_to_iso above).
+        want = str(ref_date).replace('-', '')                       # 'YYYY-MM-DD' or 'YYYYMMDD' -> 'YYYYMMDD'
+        keys = [str(d).replace('-', '') for d in dates]
+        if want not in keys:
+            raise ValueError(f"ref_date {ref_date!r} not among the {n_epoch} epochs "
+                             f"(first={dates[0]}, last={dates[-1]})")
+        ref_idx = keys.index(want)
+        ref_field_m = ts_cube_m[ref_idx].copy()                     # [L, W] per-pixel offset (metres)
+        ts_cube_m = ts_cube_m - ref_field_m[None, :, :]             # broadcast subtract over epochs
+        if verbose:
+            print(f"  Re-referenced to {dates[ref_idx]} (epoch idx {ref_idx}); "
+                  f"displacement now measured relative to that date.")
 
     # Full-resolution lon/lat (used for the optional crop and, after multilook, for coords).
     lon_grid, lat_grid = read_lonlat_grid(geom_path, full_rows, full_cols)

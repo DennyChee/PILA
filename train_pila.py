@@ -71,7 +71,7 @@ def log_compute_usage(config, logger, data_loader, model, device, data_load_sec,
                 ins['timeseries'], ins['geometry'], ins.get('mask'),
                 ins['lat0'], ins['lon0'], multilook=ins.get('multilook', 20),
                 coh_valid_frac=ins.get('coh_valid_frac', 0.5), bbox=ins.get('bbox'),
-                verbose=False)
+                ref_date=ins.get('ref_date'), verbose=False)
             usage.update({'multilook': ins.get('multilook', 20),
                           'coarse_grid': list(d.mask_d.shape),
                           'coherent_cells': int(d.mask_d.sum()),
@@ -140,8 +140,11 @@ def _propagate_insar_uq(cfg):
     arch_ins = cfg.get('arch', {}).get('args', {}).get('insar')
     if not arch_ins:
         return
+    # ref_date MUST propagate too: if the canonical block re-references to a chosen
+    # epoch but the train/valid/test blocks don't, the dataset and decoder would
+    # invert different temporal baselines for the same nominal epoch.
     uq_keys = {k: arch_ins[k] for k in
-               ('multilook', 'stride', 'offset',
+               ('multilook', 'stride', 'offset', 'ref_date',
                 'bootstrap_k', 'bootstrap_block', 'bootstrap_seed') if k in arch_ins}
     if not uq_keys:
         return

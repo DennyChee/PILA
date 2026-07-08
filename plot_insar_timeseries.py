@@ -172,9 +172,12 @@ def plot_maps_over_time(actual_mm, full_mm, d, dates, idxs, hs, hs_extent, disp_
     # Pixel count for QC: number of valid (multilooked) InSAR pixels fed to the model,
     # plus the coarse rasterization grid these are scattered onto.
     n_rows_grid, n_cols_grid = d.mask_d.shape
+    # Place the (2-line) suptitle just ABOVE the figure box so it never collides with the
+    # per-column titles — important for the single-row (single-date) layout where the figure
+    # is short. bbox_inches='tight' on save keeps it in-frame.
     fig.suptitle('PILA InSAR — temporal evolution of the LOS field (actual vs reconstruction)\n'
                  f'N = {d.n_points} valid pixels  (coarse grid {n_rows_grid}×{n_cols_grid})',
-                 fontsize=14)
+                 fontsize=14, y=1.06 if n_rows == 1 else 1.0)
     for ext in ('png', 'pdf'):
         fig.savefig(f'{out_base}_maps_over_time.{ext}', dpi=150, bbox_inches='tight')
     plt.close(fig)
@@ -410,6 +413,15 @@ def main():
                         help='config.json (default: <checkpoint_dir>/config.json)')
     parser.add_argument('--n_map_epochs', default=6, type=int,
                         help='number of epochs to show in the maps-over-time grid (default 6)')
+    parser.add_argument('--date', default=None, type=str,
+                        help='restrict the maps-over-time grid to a SINGLE epoch: the epoch whose '
+                             'acquisition date is nearest this YYYY-MM-DD (one row: actual | recon '
+                             '| residual). Overrides --n_map_epochs. Each epoch is the CUMULATIVE '
+                             'LOS field at that date relative to the stack reference date.')
+    parser.add_argument('--maps_only', action='store_true',
+                        help='write ONLY the maps-over-time deliverable (skip pixel-timeseries, '
+                             'parameters, scatter and fit-over-time). Useful for a single-date '
+                             'presentation figure.')
     parser.add_argument('--gif', action='store_true',
                         help='also write an animated GIF over ALL epochs (needs Pillow)')
     parser.add_argument('--gif_fps', default=4, type=int, help='GIF frames per second')
@@ -448,7 +460,8 @@ def main():
         insar_args['timeseries'], insar_args['geometry'], insar_args.get('mask'),
         insar_args['lat0'], insar_args['lon0'],
         multilook=multilook, coh_valid_frac=insar_args.get('coh_valid_frac', 0.5),
-        bbox=insar_args.get('bbox'), verbose=False)
+        bbox=insar_args.get('bbox'), verbose=False,
+        ref_date=insar_args.get('ref_date'))
     n_epoch = len(d.dates)
     print(f"  Loaded: N points={d.n_points}, coarse grid={d.mask_d.shape}, epochs={n_epoch}")
 
@@ -467,16 +480,30 @@ def main():
     hs, hs_extent = load_hillshade(geometry_h5, args.hs_azimuth, args.hs_altitude)
     disp_extent = list(d.extent_lonlat)
 
-    # Evenly spaced epochs for the maps grid (unique, in order).
-    k = max(1, min(args.n_map_epochs, n_epoch))
-    idxs = np.unique(np.linspace(0, n_epoch - 1, k).astype(int))
+    # Epochs shown in the maps grid.
+    if args.date is not None:
+        # Single-date mode: pick the ONE epoch whose acquisition date is nearest --date.
+        target = pd.to_datetime(args.date)
+        nearest = int(np.argmin(np.abs((date_objs - target).values.astype('timedelta64[D]'))))
+        delta_days = abs((date_objs[nearest] - target).days)
+        if delta_days > 0:
+            print(f"  NOTE: no exact epoch on {args.date}; using nearest epoch "
+                  f"{d.dates[nearest]} ({delta_days} day(s) away).")
+        else:
+            print(f"  Single-date mode: epoch {d.dates[nearest]} (index {nearest}).")
+        idxs = np.array([nearest])
+    else:
+        # Evenly spaced epochs for the maps grid (unique, in order).
+        k = max(1, min(args.n_map_epochs, n_epoch))
+        idxs = np.unique(np.linspace(0, n_epoch - 1, k).astype(int))
 
     plot_maps_over_time(actual_mm, full_mm, d, d.dates, idxs, hs, hs_extent, disp_extent, out_base)
     if args.gif:
         animate_maps(full_mm, actual_mm, d, d.dates, hs, hs_extent, disp_extent, out_base,
                      fps=args.gif_fps)
-    plot_pixel_timeseries(actual_mm, full_mm, phys_mm, d, date_objs, out_base)
-    plot_params_and_fit(actual_mm, full_mm, phys_mm, params, date_objs, out_base)
+    if not args.maps_only:
+        plot_pixel_timeseries(actual_mm, full_mm, phys_mm, d, date_objs, out_base)
+        plot_params_and_fit(actual_mm, full_mm, phys_mm, params, date_objs, out_base)
 
     print(f"Done in {time.time() - t_start:.1f}s. Output saved to {out_dir}/")
 

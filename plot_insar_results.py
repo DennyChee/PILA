@@ -394,7 +394,8 @@ def main():
         insar_args['lat0'], insar_args['lon0'],
         multilook=multilook, coh_valid_frac=insar_args.get('coh_valid_frac', 0.5),
         bbox=insar_args.get('bbox'), verbose=False, stride=stride, offset=offset,
-        bootstrap_k=bootstrap_k, bootstrap_block=bootstrap_block, bootstrap_seed=bootstrap_seed)
+        bootstrap_k=bootstrap_k, bootstrap_block=bootstrap_block, bootstrap_seed=bootstrap_seed,
+        ref_date=insar_args.get('ref_date'))
     print(f"  N points={d.n_points}, coarse grid={d.mask_d.shape}, epochs={len(d.dates)}")
 
     epoch = args.epoch

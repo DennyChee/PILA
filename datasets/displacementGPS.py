@@ -212,7 +212,8 @@ def _standardized_los_series_h5(insar_args):
         offset=insar_args.get('offset', 0),         # UQ phase offset (this ensemble member)
         bootstrap_k=insar_args.get('bootstrap_k'),  # UQ block-bootstrap target px (None = off)
         bootstrap_block=insar_args.get('bootstrap_block', 3),
-        bootstrap_seed=insar_args.get('bootstrap_seed', 0))
+        bootstrap_seed=insar_args.get('bootstrap_seed', 0),
+        ref_date=insar_args.get('ref_date'))          # temporal re-referencing (None = MintPy default)
     # GLOBAL (scene-wide) standardization with the SAME scaler the model's physics decoder
     # uses (see _load_insar_inputs). Per-point z-scoring would amplify the ~94% quiescent
     # cells' noise to signal scale and flatten the deformation, collapsing the fit to ~0.
@@ -322,7 +323,8 @@ class DisplacementInSARImage(data.Dataset):
             multilook=insar_args.get('multilook', 20),
             coh_valid_frac=insar_args.get('coh_valid_frac', 0.5),
             bbox=insar_args.get('bbox'),
-            verbose=insar_args.get('verbose', True))
+            verbose=insar_args.get('verbose', True),
+            ref_date=insar_args.get('ref_date'))          # temporal re-referencing (None = MintPy default)
         # Global z-score (same scaler the grid physics decoder uses); incoherent -> 0.
         std_grid = (d.los_mm - d.x_mean_global) / d.x_scale_global   # [n_epoch, Hd, Wd]
         std_grid = np.nan_to_num(std_grid, nan=0.0).astype(np.float32)
