@@ -252,6 +252,92 @@ def _multilook_2d(arr_2d, mask_2d, factor):
     return coarse[0]
 
 
+# --- native .npz scene reader (local x/y frame, any grid size) ---------------
+NPZ_TRACKS = ('asc', 'desc')
+
+
+def _read_npz_scene(npz_path, track, verbose=True):
+    """
+    Read a gridded LOS scene stored as .npz in a LOCAL metric frame (e.g. the COMSOL
+    wk6 chamber catalogue) into the full-resolution arrays load_insar_mintpy needs.
+
+    Expected npz keys (the COMSOL wk6 schema):
+      x_m [W], y_m [H]             map axes, metres, local frame (origin = (0, 0))
+      los_<track>_m [n, H, W]      LOS displacement, metres, + = toward satellite
+      incidence_deg                scalar or [H, W], deg from vertical
+      heading_<track>_deg          scalar or [H, W], flight heading, deg clockwise from N
+      dates (optional)             [n] 'YYYYMMDD' / 'YYYY-MM-DD'; placeholders otherwise
+      mask  (optional)             [H, W] bool, True = keep
+
+    Inputs : npz_path str   path to the .npz
+             track    str   'asc' or 'desc' (passed through the config 'geometry' key)
+    Output : ts_cube_m [n, H, W] float32 (m), dates list[str] ISO, and a dict with
+             full-res east_km/north_km/inc_deg/az_deg [H, W] and mask [H, W] (or None).
+             Rows are ordered NORTH -> SOUTH (MintPy convention) on return.
+    """
+    track = str(track).lower()
+    if track not in NPZ_TRACKS:
+        raise ValueError(f"For .npz input the 'geometry' key selects the track and must be "
+                         f"one of {NPZ_TRACKS}; got {track!r}")
+    if verbose:
+        print(f"[insar_mintpy 1/5] Loading npz scene {npz_path} (track={track}) ...")
+    with np.load(npz_path) as f:
+        los_key = f'los_{track}_m'
+        head_key = f'heading_{track}_deg'
+        for key in ('x_m', 'y_m', los_key, 'incidence_deg', head_key):
+            if key not in f.files:
+                raise KeyError(f"{npz_path} is missing required key {key!r} (has {f.files})")
+        x_m = np.asarray(f['x_m'], dtype=np.float64)
+        y_m = np.asarray(f['y_m'], dtype=np.float64)
+        ts_cube_m = np.asarray(f[los_key], dtype=np.float32)          # [n, H, W], metres
+        inc_deg = np.asarray(f['incidence_deg'], dtype=np.float64)
+        heading_deg = np.asarray(f[head_key], dtype=np.float64)
+        dates_raw = np.asarray(f['dates']) if 'dates' in f.files else None
+        mask = np.asarray(f['mask'], dtype=bool) if 'mask' in f.files else None
+    n_samples, n_rows, n_cols = ts_cube_m.shape
+    if (y_m.size, x_m.size) != (n_rows, n_cols):
+        raise ValueError(f"axis lengths (y={y_m.size}, x={x_m.size}) do not match "
+                         f"{los_key} grid {n_rows}x{n_cols}")
+    if verbose:
+        print(f"  Loaded: shape={ts_cube_m.shape}, dtype={ts_cube_m.dtype} "
+              f"(metres, local frame; lat0/lon0 are NOT used for npz input)")
+
+    # Local coordinates directly in km: no lon/lat projection round trip.
+    east_km, north_km = np.meshgrid(x_m / 1000.0, y_m / 1000.0)      # [H, W]
+    # Broadcast scalar geometry to the grid. MintPy azimuthAngle (ground->satellite, from
+    # north, anticlockwise +) = 90 - heading for a right-looking SAR, so the existing
+    # enu_to_los_unit_vectors reproduces l = (sin(inc)sin(hdg-90), sin(inc)cos(hdg-90), cos(inc)).
+    inc_grid_deg = np.broadcast_to(inc_deg, (n_rows, n_cols)).astype(np.float64)
+    az_grid_deg = np.broadcast_to(90.0 - heading_deg, (n_rows, n_cols)).astype(np.float64)
+    if mask is not None and mask.shape != (n_rows, n_cols):
+        raise ValueError(f"npz mask shape {mask.shape} != grid {(n_rows, n_cols)}")
+
+    # Put row 0 = NORTH (MintPy convention) so the CNN image path and the map plots see the
+    # same orientation as a MintPy cube. Coordinates flip with the data, so physics is unaffected.
+    if n_rows > 1 and y_m[1] > y_m[0]:
+        ts_cube_m = ts_cube_m[:, ::-1, :]
+        east_km, north_km = east_km[::-1, :], north_km[::-1, :]
+        inc_grid_deg, az_grid_deg = inc_grid_deg[::-1, :], az_grid_deg[::-1, :]
+        mask = mask[::-1, :] if mask is not None else None
+
+    if dates_raw is not None:
+        dates = [(s.decode() if isinstance(s, (bytes, bytearray)) else str(s)).replace('-', '')
+                 for s in dates_raw]
+        dates = [f"{s[0:4]}-{s[4:6]}-{s[6:8]}" for s in dates]
+    else:
+        # Samples are not a time series (e.g. 40 independent chambers): give each one a
+        # placeholder daily date so date-keyed code (time features, plots) still runs.
+        dates = [str(np.datetime64('2000-01-01') + np.timedelta64(k, 'D')) for k in range(n_samples)]
+        if verbose:
+            print(f"  NOTE: no 'dates' key; using {n_samples} placeholder daily dates from 2000-01-01 "
+                  f"(sample k keeps npz order)")
+
+    geom = dict(east_km=np.ascontiguousarray(east_km), north_km=np.ascontiguousarray(north_km),
+                inc_deg=np.ascontiguousarray(inc_grid_deg), az_deg=np.ascontiguousarray(az_grid_deg),
+                mask=None if mask is None else np.ascontiguousarray(mask))
+    return np.ascontiguousarray(ts_cube_m), dates, geom
+
+
 # --- main loader (memoized) -------------------------------------------------
 _CACHE = {}  # key -> InSARData; guarantees dataset & model see identical points
 
@@ -308,6 +394,14 @@ def load_insar_mintpy(timeseries_h5, geometry_h5, mask_h5, lat0, lon0,
     -------
     InSARData
 
+    NPZ input
+    ---------
+    If `timeseries_h5` ends in '.npz', the scene is read natively by _read_npz_scene (local
+    x/y metres, any grid size, no resampling). Then `geometry_h5` is the track token 'asc' or
+    'desc', `mask_h5` must be None (put an optional 'mask' array in the npz instead), `bbox`
+    is not supported, lat0/lon0 are ignored (the npz frame is already local), and
+    `extent_lonlat` holds the LOCAL km extent (x_min, x_max, y_min, y_max), not degrees.
+
     Notes
     -----
     The module-level memo (_CACHE) lives in the calling process. Use DataLoader
@@ -317,7 +411,17 @@ def load_insar_mintpy(timeseries_h5, geometry_h5, mask_h5, lat0, lon0,
     """
     # Resolve to absolute paths so cache keys and h5py see the same thing regardless of cwd.
     ts_path = timeseries_h5 if os.path.isabs(timeseries_h5) else os.path.join(PARENT_DIR, timeseries_h5)
-    geom_path = geometry_h5 if os.path.isabs(geometry_h5) else os.path.join(PARENT_DIR, geometry_h5)
+    # Native .npz scene (local x/y frame): 'geometry' carries the track token, not a file.
+    is_npz = str(timeseries_h5).lower().endswith('.npz')
+    if is_npz:
+        geom_path = str(geometry_h5).lower()
+        if mask_h5:
+            raise ValueError("mask file is not supported for .npz input; store a 'mask' "
+                             "array inside the npz instead")
+        if bbox is not None:
+            raise NotImplementedError("bbox (lon/lat crop) is not supported for .npz input")
+    else:
+        geom_path = geometry_h5 if os.path.isabs(geometry_h5) else os.path.join(PARENT_DIR, geometry_h5)
     mask_path = mask_h5 if (mask_h5 and os.path.isabs(mask_h5)) else (
         os.path.join(PARENT_DIR, mask_h5) if mask_h5 else None)
 
@@ -358,16 +462,20 @@ def load_insar_mintpy(timeseries_h5, geometry_h5, mask_h5, lat0, lon0,
     if cache_key in _CACHE:
         return _CACHE[cache_key]
 
-    for path in (ts_path, geom_path):
+    for path in ((ts_path,) if is_npz else (ts_path, geom_path)):
         if not os.path.exists(path):
             raise FileNotFoundError(path)
 
     # --- [1/5] Load LOS cube + dates ---------------------------------------
-    if verbose:
-        print(f"[insar_mintpy 1/5] Loading time series from {ts_path} ...")
-    with h5py.File(ts_path, 'r') as f:
-        ts_cube_m = np.array(f['timeseries'], dtype=np.float32)   # [n_epoch, L, W], metres
-        dates = date_bytes_to_iso(np.array(f['date']))
+    npz_geom = None
+    if is_npz:
+        ts_cube_m, dates, npz_geom = _read_npz_scene(ts_path, geom_path, verbose)
+    else:
+        if verbose:
+            print(f"[insar_mintpy 1/5] Loading time series from {ts_path} ...")
+        with h5py.File(ts_path, 'r') as f:
+            ts_cube_m = np.array(f['timeseries'], dtype=np.float32)   # [n_epoch, L, W], metres
+            dates = date_bytes_to_iso(np.array(f['date']))
     n_epoch, full_rows, full_cols = ts_cube_m.shape
     if verbose:
         print(f"  Loaded: shape={ts_cube_m.shape}, dtype={ts_cube_m.dtype}, n_epoch={n_epoch}")
@@ -393,7 +501,12 @@ def load_insar_mintpy(timeseries_h5, geometry_h5, mask_h5, lat0, lon0,
                   f"displacement now measured relative to that date.")
 
     # Full-resolution lon/lat (used for the optional crop and, after multilook, for coords).
-    lon_grid, lat_grid = read_lonlat_grid(geom_path, full_rows, full_cols)
+    # For npz input these slots hold the local East/North km grids instead (bbox is refused
+    # for npz above, so they are only multilooked and used for coords/extent below).
+    if is_npz:
+        lon_grid, lat_grid = npz_geom['east_km'], npz_geom['north_km']
+    else:
+        lon_grid, lat_grid = read_lonlat_grid(geom_path, full_rows, full_cols)
 
     # --- Optional spatial crop to a lon/lat bounding box -------------------
     row0, row1, col0, col1 = 0, full_rows, 0, full_cols
@@ -422,6 +535,10 @@ def load_insar_mintpy(timeseries_h5, geometry_h5, mask_h5, lat0, lon0,
             keep_mask = np.array(f[mask_key], dtype=bool)[row0:row1, col0:col1]
         if verbose:
             print(f"[insar_mintpy 2/5] Using mask dataset '{mask_key}'")
+    elif is_npz and npz_geom['mask'] is not None:
+        keep_mask = npz_geom['mask']
+        if verbose:
+            print("[insar_mintpy 2/5] Using 'mask' array from the npz")
     else:
         keep_mask = np.ones((n_rows, n_cols), dtype=bool)
         if verbose:
@@ -497,9 +614,12 @@ def load_insar_mintpy(timeseries_h5, geometry_h5, mask_h5, lat0, lon0,
             if int(mask_d.sum()) == 0:
                 raise ValueError(f"block-bootstrap seed={bootstrap_seed} selects 0 cells")
 
-    with h5py.File(geom_path, 'r') as f:
-        inc_full = np.array(f['incidenceAngle'], dtype=np.float64)[row0:row1, col0:col1]
-        az_full = np.array(f['azimuthAngle'], dtype=np.float64)[row0:row1, col0:col1]
+    if is_npz:
+        inc_full, az_full = npz_geom['inc_deg'], npz_geom['az_deg']
+    else:
+        with h5py.File(geom_path, 'r') as f:
+            inc_full = np.array(f['incidenceAngle'], dtype=np.float64)[row0:row1, col0:col1]
+            az_full = np.array(f['azimuthAngle'], dtype=np.float64)[row0:row1, col0:col1]
     lon_d = _multilook_2d(lon_grid, keep_mask, multilook)
     lat_d = _multilook_2d(lat_grid, keep_mask, multilook)
     inc_d = _multilook_2d(inc_full, keep_mask, multilook)
@@ -507,6 +627,7 @@ def load_insar_mintpy(timeseries_h5, geometry_h5, mask_h5, lat0, lon0,
     rows_d, cols_d = mask_d.shape
 
     # Geographic extent of the coarse grid (the multilook crops to whole blocks), for plots.
+    # For npz input this is the LOCAL km extent (x_min, x_max, y_min, y_max), not degrees.
     rk, ck = rows_d * multilook, cols_d * multilook
     extent_lonlat = (float(lon_grid[:rk, :ck].min()), float(lon_grid[:rk, :ck].max()),
                      float(lat_grid[:rk, :ck].min()), float(lat_grid[:rk, :ck].max()))
@@ -516,8 +637,12 @@ def load_insar_mintpy(timeseries_h5, geometry_h5, mask_h5, lat0, lon0,
     # --- [4/5] Per-cell ENU coords + LOS unit vectors ----------------------
     # Compute on coherent cells only (avoids NaN propagating through enu2los), scatter back.
     coh_rows, coh_cols = np.where(mask_d)
-    east_km, north_km = lonlat_to_local_enu_km(
-        lon_d[coh_rows, coh_cols], lat_d[coh_rows, coh_cols], lat0, lon0)
+    if is_npz:
+        # Already local East/North km (multilooked like the h5 lon/lat): no projection.
+        east_km, north_km = lon_d[coh_rows, coh_cols], lat_d[coh_rows, coh_cols]
+    else:
+        east_km, north_km = lonlat_to_local_enu_km(
+            lon_d[coh_rows, coh_cols], lat_d[coh_rows, coh_cols], lat0, lon0)
     losE_c, losN_c, losU_c = enu_to_los_unit_vectors(
         inc_d[coh_rows, coh_cols], az_d[coh_rows, coh_cols])
 

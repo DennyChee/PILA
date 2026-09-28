@@ -83,7 +83,13 @@ def main():
 
         # --- grids + hillshade + shared symmetric scale ---
         disp_extent = list(d.extent_lonlat)
-        hs, hs_extent = load_hillshade(ia["geometry"], args.hs_azimuth, args.hs_altitude)
+        # Local-frame npz scenes (e.g. COMSOL): "geometry" is a track token and the extent is
+        # km, so there is no DEM to hillshade and the axes are East/North (km), not lon/lat.
+        is_npz_scene = str(ia["timeseries"]).lower().endswith(".npz")
+        if is_npz_scene:
+            hs, hs_extent = None, None
+        else:
+            hs, hs_extent = load_hillshade(ia["geometry"], args.hs_azimuth, args.hs_altitude)
         vmax = float(np.nanpercentile(np.abs(actual_mm), 98))
 
         panels = [("Observed LOS", actual_mm)]
@@ -98,15 +104,16 @@ def main():
             axes = [axes]
         im = None
         for ax, (title, vals) in zip(axes, panels):
-            ax.imshow(hs, extent=hs_extent, cmap="gray", origin="upper")
+            if hs is not None:
+                ax.imshow(hs, extent=hs_extent, cmap="gray", origin="upper")
             grid = points_to_grid(vals, d.mask_d)
             im = ax.imshow(np.ma.masked_invalid(grid), extent=disp_extent, origin="upper",
                            cmap="RdBu_r", vmin=-vmax, vmax=vmax, alpha=0.95)
             ax.set_xlim(disp_extent[0], disp_extent[1])
             ax.set_ylim(disp_extent[2], disp_extent[3])
             ax.set_title(title, fontsize=11)
-            ax.set_xlabel("Longitude (°)")
-        axes[0].set_ylabel("Latitude (°)")
+            ax.set_xlabel("East (km)" if is_npz_scene else "Longitude (°)")
+        axes[0].set_ylabel("North (km)" if is_npz_scene else "Latitude (°)")
         cb = fig.colorbar(im, ax=axes, shrink=0.85, location="right")
         cb.set_label("LOS displacement (mm)  [+ = toward satellite]")
         fig.suptitle(f"{cfg}  —  {model.capitalize()}  —  epoch {epoch}", fontsize=13, fontweight="bold")

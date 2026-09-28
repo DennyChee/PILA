@@ -281,13 +281,16 @@ def plot_maps(actual_mm, phys_mm, full_mm, disp_extent, hs, hs_extent, out_base,
     fig, axes = plt.subplots(1, 4, figsize=(22, 6), constrained_layout=True)
     for ax, (title, grid, scale) in zip(axes, panels):
         # Hillshade background (grayscale), then displacement on top (NaN = transparent).
-        ax.imshow(hs, extent=hs_extent, cmap='gray', origin='upper',
-                  vmin=0.0, vmax=1.0, zorder=0)
+        # hs is None for local-frame npz scenes (no DEM): plot the displacement alone, in km.
+        if hs is not None:
+            ax.imshow(hs, extent=hs_extent, cmap='gray', origin='upper',
+                      vmin=0.0, vmax=1.0, zorder=0)
         im = ax.imshow(np.ma.masked_invalid(grid), extent=disp_extent, origin='upper',
-                       cmap='RdBu_r', vmin=-scale, vmax=scale, alpha=disp_alpha, zorder=1)
+                       cmap='RdBu_r', vmin=-scale, vmax=scale,
+                       alpha=disp_alpha if hs is not None else 1.0, zorder=1)
         ax.set_title(title)
-        ax.set_xlabel('Longitude (deg)')
-        ax.set_ylabel('Latitude (deg)')
+        ax.set_xlabel('Longitude (deg)' if hs is not None else 'East (km)')
+        ax.set_ylabel('Latitude (deg)' if hs is not None else 'North (km)')
         ax.set_xlim(disp_extent[0], disp_extent[1])
         ax.set_ylim(disp_extent[2], disp_extent[3])
         cbar = fig.colorbar(im, ax=ax, shrink=0.8)
@@ -373,7 +376,8 @@ def main():
     config = read_json(cfg_path)
 
     insar_args = config['arch']['args']['insar']
-    geometry_h5 = insar_args['geometry']
+    geometry_h5 = insar_args['geometry']   # for .npz scenes this is the track token ('asc'/'desc')
+    is_npz_scene = str(insar_args['timeseries']).lower().endswith('.npz')
     multilook = int(insar_args.get('multilook', 1))   # default 1 = no multilook
     # UQ strided-decimation OR block-bootstrap: plot the SAME subset of cells the model inverted.
     stride = int(insar_args.get('stride', 1))
@@ -430,7 +434,9 @@ def main():
     if not config['arch']['phys_vae']['no_phy']:
         params = model.physics_model.rescale(latent_phy)
         param_text = format_param_text(params)
-        src_ll = source_lonlat(params, insar_args['lat0'], insar_args['lon0'])
+        # Local-frame npz scenes have no geographic peg: xcen/ycen (km) already locate the source.
+        src_ll = (None if is_npz_scene else
+                  source_lonlat(params, insar_args['lat0'], insar_args['lon0']))
         # Report the prior box used and flag any parameter pinned to a bound (railing) --
         # the diagnostic for the Okada non-identifiability / degenerate-corner problem.
         bounds_block, prior_footnote = prior_bounds_report(model.physics_model, params)
@@ -456,7 +462,11 @@ def main():
     phys_grid = points_to_grid(phys_mm, d.mask_d)
     full_grid = points_to_grid(full_mm, d.mask_d)
     disp_extent = list(d.extent_lonlat)   # [lon_min, lon_max, lat_min, lat_max] (honours bbox crop)
-    hs, hs_extent = load_hillshade(geometry_h5, args.hs_azimuth, args.hs_altitude)
+    if is_npz_scene:
+        # npz scenes: extent is local km and there is no DEM to hillshade.
+        hs, hs_extent = None, None
+    else:
+        hs, hs_extent = load_hillshade(geometry_h5, args.hs_azimuth, args.hs_altitude)
 
     # --- [6/6] Plot ---
     out_dir = args.output_dir or os.path.join(os.path.dirname(os.path.dirname(resume_path)), 'figures')
