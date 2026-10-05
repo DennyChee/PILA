@@ -44,12 +44,12 @@ def draw_fixed_set(rng, grid, noise_pool, sigma_ref_mm, prior, noise_mode, split
     return out
 
 
-def plot_network_input(train_items, val_ds, test_ds, meta, out_dir):
+def plot_network_input(train_items, val_ds, test_ds, meta, out_dir, extent=(-20, 20, -20, 20)):
     """Figure 3: standardized input maps per K, as the network sees them, with target text."""
     k_max = meta['prior']['k_max']
     n_cols = 4
     fig, axes = plt.subplots(k_max + 1, n_cols, figsize=(4.0 * n_cols, 3.6 * (k_max + 1)), squeeze=False)
-    extent = [-20, 20, -20, 20]
+    extent = list(extent)                    # map extent in km (E_min, E_max, N_min, N_max)
     for k in range(k_max + 1):
         items_k = [it for it in train_items if int(it['k']) == k][:n_cols]
         for col, item in enumerate(items_k):

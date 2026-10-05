@@ -59,17 +59,24 @@ PRIOR = {
 }
 
 
-def load_grid():
+def load_grid(geometry_h5=None, lat0_deg=LAT0_DEG, lon0_deg=LON0_DEG):
     """
-    Load the Marapi idealized grid as flattened ENU coordinates and LOS unit vectors.
+    Load an idealized grid as flattened ENU coordinates and LOS unit vectors.
+
+    geometry_h5 defaults to the original descending Marapi grid; pass
+    synthetic/marapi_ta69_grid/geo_geometryRadar.h5 for the ascending TA69-matched grid.
+    (Relative paths are resolved against the project root.)
 
     Returns
     -------
     grid : dict  xE_m, yN_m, losE, losN, losU (all [n_px] float64), shape (L, W).
     """
-    if not os.path.exists(GEOMETRY_H5):
-        raise FileNotFoundError(GEOMETRY_H5)
-    xE_m, yN_m, losE, losN, losU, shape = load_full_res_geometry(GEOMETRY_H5, LAT0_DEG, LON0_DEG)
+    geometry_h5 = geometry_h5 or GEOMETRY_H5
+    if not os.path.isabs(geometry_h5):
+        geometry_h5 = os.path.join(PROJECT_ROOT, geometry_h5)
+    if not os.path.exists(geometry_h5):
+        raise FileNotFoundError(geometry_h5)
+    xE_m, yN_m, losE, losN, losU, shape = load_full_res_geometry(geometry_h5, lat0_deg, lon0_deg)
     # Plots use imshow(origin='upper') with marker coords in km: requires row 0 = north.
     if not (yN_m[0, 0] > yN_m[-1, 0]):
         raise ValueError("Grid is not north-up (row 0 must be the northernmost row)")

@@ -1,0 +1,50 @@
+{
+  "name": "ta69_noisy_detr",
+  "description": "Stage-1 supervised multi-source Mogi on the Marapi TA69-matched ascending grid with synthetic Marapi APS (ERA5 MatAPS + turbulent + orbit + white), random ramp and ref-pixel referencing; peak/sigma 0.5-10; DETR-lite + Hungarian",
+  "data_dir": "synthetic/multisource/stage1_ta69_noisy_pk0.5-10",
+  "out_root": "saved/multisource",
+  "codec": {
+    "xy_half_km": 15.0,
+    "depth_mid_km": 5.5,
+    "depth_half_km": 4.5,
+    "logdv_mid": 6.5,
+    "logdv_half": 1.5
+  },
+  "model": {
+    "n_queries": 4,
+    "d_model": 128,
+    "nhead": 4,
+    "n_enc_layers": 2,
+    "n_dec_layers": 3,
+    "ff_dim": 256,
+    "stem_ch": 16,
+    "stage_ch": [
+      32,
+      64,
+      128
+    ],
+    "depletion": false,
+    "gamma": 5.0
+  },
+  "criterion": {
+    "assignment": "hungarian",
+    "nll_warmup_steps": 2000,
+    "w_exist": 1.0,
+    "w_param": 1.0,
+    "w_sign": 0.5,
+    "nll_ramp_steps": 2000,
+    "nll_weight": 0.1
+  },
+  "train": {
+    "steps": 20000,
+    "batch_size": 64,
+    "lr": 0.0002,
+    "weight_decay": 0.0001,
+    "warmup_steps": 1000,
+    "grad_clip": 1.0,
+    "eval_every": 500,
+    "n_val": 1000,
+    "seed": 1,
+    "threads": 8
+  }
+}
