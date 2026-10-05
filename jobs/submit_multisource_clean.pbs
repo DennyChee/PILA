@@ -1,0 +1,40 @@
+#!/bin/bash
+# Usage:       qsub -v CONFIG=configs/multisource/clean_detr.json jobs/submit_multisource_clean.pbs
+#              (one job per config; submit the three Stage-1 variants in parallel:
+#               clean_detr.json, clean_detr_depletion.json, clean_fixed_baseline.json)
+# Description: Stage-1 SUPERVISED multi-source Mogi training on noise-free synthetic scenes
+#              (CPU, 8 threads). Scenes are generated on the fly; validation on the fixed
+#              val set of synthetic/multisource/stage1_clean_pk2-10. Output goes to
+#              saved/multisource/<config name>/<MMDD_HHMMSS>/ (log.csv, model_best/last.pth).
+# Date:        2026-10-05
+#PBS -N ms_clean
+#PBS -P eos_btaisne
+#PBS -q qintel_wfly
+#PBS -l nodes=1:ppn=8
+#PBS -l walltime=12:00:00
+#PBS -l mem=16gb
+#PBS -j oe
+#PBS -o logs/multisource_clean_pbs.log
+
+set -e
+cd "$PBS_O_WORKDIR"
+
+# --- Environment (project env is 'pila', NOT base) ---
+source /eos-rs/miniconda3/etc/profile.d/conda.sh
+conda activate pila
+export PYTHONPATH="${PYTHONPATH}:$PBS_O_WORKDIR"
+export OMP_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+export MKL_THREADING_LAYER=GNU
+
+if [ -z "$CONFIG" ] || [ ! -f "$CONFIG" ]; then
+  echo "ERROR: pass an existing config with: qsub -v CONFIG=configs/multisource/<name>.json" >&2
+  exit 1
+fi
+NAME="$(basename "$CONFIG" .json)"
+LOG="logs/multisource_${NAME}_${PBS_JOBID%%.*}.log"
+
+echo "[ms_clean] Host: $(hostname)  Env: $CONDA_DEFAULT_ENV  Config: $CONFIG  Start: $(date)"
+echo "[ms_clean] Training log: $LOG"
+python train_multisource.py --config "$CONFIG" > "$LOG" 2>&1
+echo "[ms_clean] Finished: $(date)"
