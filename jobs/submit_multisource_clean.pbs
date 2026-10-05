@@ -36,5 +36,5 @@ LOG="logs/multisource_${NAME}_${PBS_JOBID%%.*}.log"
 
 echo "[ms_clean] Host: $(hostname)  Env: $CONDA_DEFAULT_ENV  Config: $CONFIG  Start: $(date)"
 echo "[ms_clean] Training log: $LOG"
-python train_multisource.py --config "$CONFIG" > "$LOG" 2>&1
+python -u train_multisource.py --config "$CONFIG" > "$LOG" 2>&1   # -u: unbuffered, log updates live
 echo "[ms_clean] Finished: $(date)"
