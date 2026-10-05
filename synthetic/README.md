@@ -66,8 +66,16 @@ python -m synthetic.validate_all --spec <spec.json> --multilook 1 --ckpt <model_
 
 ## 3. Conventions (important)
 
-- **Marapi** is the volcano name; the displacement data dir on disk is literally spelled
-  `/eos-rs/INSAR_processing/denny/Merapi/S1_TA76/` — keep that path verbatim.
+- **Marapi** (W. Sumatra, -0.38, 100.47) and **Merapi** (Central Java, -7.54, 110.44) are
+  different volcanoes. Real Marapi data: `/eos-rs/INSAR_processing/denny/Marapi/S1_TA69/`
+  (Sentinel-1 ascending track 69). `/eos-rs/INSAR_processing/denny/Merapi/S1_TA76/` is
+  **Merapi (Java)**, not Marapi (corrected 2026-10-05; this line previously said otherwise).
+  The idealized grid in `marapi_grid/` is centred on Marapi but uses descending Sierra Negra
+  geometry; `marapi_ta69_grid/` matches real TA69 (ascending, x4 multilook).
+- **Noise cube provenance:** the `trop` component is the ERA5 (MatAPS) delay difference between
+  consecutive dates in the Marapi S1 T69A radar geometry, with the **whole radar frame**
+  `imresize`d to 128x128 (so its spatial scale is compressed relative to the nominal 40 km
+  grid), and it is the delay itself — real `*_ERA5*` MintPy products have it removed.
 - **SNR** = `20·log10( signal_rms / noise_rms )`, signal at the peak epoch, noise the mean
   per-epoch RMS, over mask pixels (MATLAB `mogi_snr_vbica_bench.m` convention).
 - **SNR is varied** by the source amplitude (dV) at **fixed noise**. Calibration:

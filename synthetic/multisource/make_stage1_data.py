@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # Usage:       python -m synthetic.multisource.make_stage1_data \
-#                  --out synthetic/multisource/stage1_clean_r2-10 --noise none \
+#                  --out synthetic/multisource/stage1_clean_pk2-10 --noise none \
 #                  --peak-ratio-min 2 --peak-ratio-max 10 --n-val 2000 --n-test 2000
 # Description: Build a Stage-1 data directory for supervised multi-source PILA: (1) the
 #              global SCALE-ONLY input scaler (RMS of observed LOS, mm; mean fixed 0) from TRAIN
