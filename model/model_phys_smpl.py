@@ -305,6 +305,11 @@ class Physics_RTM(nn.Module):
         return (output - self.x_mean) / self.x_scale 
 
 class Physics_Mogi(nn.Module):
+    # km -> m parameters (matches the hardcoded list in rescale()). Class attribute so the
+    # *_LOS / *_Grid subclasses inherit it even though they skip this __init__; used by
+    # plot_insar_results.prior_bounds_report to compare values and bounds in the same units.
+    km_params = ['xcen', 'ycen', 'd']
+
     def __init__(self, config:dict):
         super(Physics_Mogi, self).__init__()
 
@@ -338,7 +343,7 @@ class Physics_Mogi(nn.Module):
             else:
                 z_phy_rescaled[para_name] = z_phy[:, i]*(maxv-minv)+minv
 
-            if para_name in ['xcen', 'ycen', 'd']:
+            if para_name in self.km_params:
                 z_phy_rescaled[para_name] = z_phy_rescaled[para_name]*1000
 
         # dV magnitude transform: physical dV = (rescaled dV) * dV_scale + dV_shift.
@@ -557,6 +562,129 @@ def _load_points_los(config:dict):
     return points_info, x_east_m, y_north_m, los_E, los_N, los_U
 
 
+def _load_insar_data(config:dict):
+    """
+    The memoized InSARData for arch.args.insar (same kwargs, hence same cache entry, as
+    the dataset), shared by the point/grid input builders and the topography offset.
+    """
+    from datasets.preprocessing.insar_mintpy import load_insar_mintpy
+    ins = config['arch']['args']['insar']
+    return load_insar_mintpy(
+        ins['timeseries'], ins['geometry'], ins.get('mask'),
+        ins['lat0'], ins['lon0'], multilook=ins.get('multilook', 1),   # default 1 = no multilook
+        coh_valid_frac=ins.get('coh_valid_frac', 0.5), bbox=ins.get('bbox'), verbose=False,
+        standardization=ins.get('std_mode', 'global'), far_field=ins.get('far_field'),
+        stride=ins.get('stride', 1), offset=ins.get('offset', 0),   # UQ decimation (must match dataset)
+        bootstrap_k=ins.get('bootstrap_k'), bootstrap_block=ins.get('bootstrap_block', 3),
+        bootstrap_seed=ins.get('bootstrap_seed', 0),
+        ref_date=ins.get('ref_date'))          # temporal re-referencing (must match dataset)
+
+
+TOPO_MODES = ('none', 'varying_depth')
+
+
+def _build_topo_offset(config:dict, z_phy_ranges:dict, depth_key:str, grid:bool):
+    """
+    Per-observation topographic depth offset (h_i - h_ref) for the Williams & Wadge (1998)
+    first-order "varying depth" correction, as in the MATLAB iokada_agung_residuals.m
+    'TopoCorrection','varying_depth' option.
+
+    The source sits at depth d below the datum h_ref; observation i at elevation h_i then
+    sees it d + (h_i - h_ref) below. The free surface stays FLAT (half-space Green's
+    functions), x/y and LOS vectors are unchanged: vertical displacement is well corrected,
+    horizontals only partially, and slope effects (> ~20 deg, Cayol & Cornet 1998) are not
+    modelled. Reported depths are relative to h_ref (h_ref = 0 -> the DEM datum; MintPy
+    'height' is usually WGS84-ellipsoidal, not geoid).
+
+    Config: arch.args.topography = {"mode": "none" | "varying_depth",
+                                    "h_ref_m": <float> | "max" | "mean" | "median"}
+            (missing block -> "none": flat model, exact original code path).
+
+    Inputs : config        full config dict
+             z_phy_ranges  parsed *_paras.json (depth bounds in km)
+             depth_key     name of the depth parameter ('d' Mogi, 'depth' Okada/Sun69)
+             grid          True for the CNN full-grid decoders (all Hd*Wd cells, row-major),
+                           False for the coherent-point decoders
+    Output : Tensor [N_obs] float32 (m, CPU like the coordinates) or None when mode='none'.
+             Masked grid cells get 0 (their LOS vector is 0; NaN*0 would still be NaN).
+    """
+    args = config['arch']['args']
+    topo_cfg = args.get('topography') or {}
+    mode = topo_cfg.get('mode', 'none')
+    if mode not in TOPO_MODES:
+        raise ValueError(f"arch.args.topography.mode must be one of {TOPO_MODES}; got {mode!r}")
+    if mode == 'none':
+        return None
+    if 'insar' not in args:
+        raise ValueError("topography 'varying_depth' needs an arch.args.insar scene (the legacy "
+                         "points_info JSON path carries no elevation)")
+    d = _load_insar_data(config)
+    if d.height_pts_m is None:
+        raise ValueError(f"topography 'varying_depth' requested but the scene "
+                         f"{args['insar']['timeseries']} has no elevation (MintPy geometry "
+                         f"'height' dataset or npz 'height_m' key)")
+    height_pts_m = d.height_pts_m.astype(np.float64)              # coherent cells, m
+    if not np.all(np.isfinite(height_pts_m)):
+        raise ValueError(f"{int(np.sum(~np.isfinite(height_pts_m)))} coherent cells have "
+                         f"non-finite elevation; fix the DEM / mask before using topography")
+
+    # Reference elevation (datum of the reported depth), m.
+    h_ref_spec = topo_cfg.get('h_ref_m', 0.0)
+    h_ref_stats = {'max': np.max, 'mean': np.mean, 'median': np.median}
+    if isinstance(h_ref_spec, str):
+        ins = args['insar']
+        if ins.get('stride', 1) > 1 or ins.get('bootstrap_k') is not None:
+            # Each UQ member sees a different cell subset, so a statistic would put every
+            # member's depth on a different datum.
+            raise ValueError("topography.h_ref_m must be numeric for UQ subsets (stride / "
+                             f"bootstrap_k); got {h_ref_spec!r}")
+        if h_ref_spec not in h_ref_stats:
+            raise ValueError(f"topography.h_ref_m must be a number or one of "
+                             f"{list(h_ref_stats)}; got {h_ref_spec!r}")
+        h_ref_m = float(h_ref_stats[h_ref_spec](height_pts_m))
+    else:
+        h_ref_m = float(h_ref_spec)
+
+    if grid:
+        # Row-major over Hd x Wd like the coordinates; masked cells -> dz = 0.
+        height_grid_m = np.asarray(d.height_grid_m, dtype=np.float64)
+        dz_m = np.where(d.mask_d, height_grid_m - h_ref_m, 0.0).reshape(-1)
+    else:
+        dz_m = height_pts_m - h_ref_m
+
+    # Positivity guard (MATLAB precondition): the shallowest allowed source must stay below
+    # the highest observation, otherwise the effective depth turns negative and the vertical
+    # displacement silently flips sign. Sigmoid bounds keep d >= d_min, so this is sufficient.
+    depth_min_m = float(z_phy_ranges[depth_key]['min']) * 1000.0   # paras depth in km
+    dz_max_obs_m = float(np.max(height_pts_m - h_ref_m))           # highest coherent cell
+    dz_min_obs_m = float(np.min(height_pts_m - h_ref_m))
+    if depth_min_m + dz_min_obs_m <= 0.0:
+        raise ValueError(
+            f"topography: min depth bound {depth_min_m:.0f} m + min(h - h_ref) "
+            f"{dz_min_obs_m:.0f} m <= 0 -> effective depth can be <= 0 at some cells. Raise the "
+            f"{depth_key} lower bound or lower h_ref_m (currently {h_ref_m:.1f} m).")
+    # Okada: 'depth' is the CENTROID; the up-dip edge sits (W/2) sin(dip) shallower. Warn (not
+    # raise: the flat model already tolerates this) if the widest, steepest dike allowed by the
+    # bounds could breach the flat free surface below the lowest coherent cell.
+    if 'width' in z_phy_ranges and 'dip' in z_phy_ranges:
+        half_width_vertical_m = (0.5 * float(z_phy_ranges['width']['max']) * 1000.0
+                                 * np.sin(np.deg2rad(min(90.0, float(z_phy_ranges['dip']['max'])))))
+        if depth_min_m + dz_min_obs_m - half_width_vertical_m <= 0.0:
+            print(f"  WARNING topography: Okada up-dip edge can reach the surface "
+                  f"(depth_min {depth_min_m:.0f} m + min(h - h_ref) {dz_min_obs_m:.0f} m - "
+                  f"W_max/2 sin(dip_max) {half_width_vertical_m:.0f} m <= 0)")
+    if not str(args['insar']['timeseries']).endswith('.npz'):
+        # MintPy 'height' is normally WGS84-ellipsoidal; exact zeros are often DEM voids/water.
+        n_zero = int(np.sum(height_pts_m == 0.0))
+        print(f"  NOTE topography: MintPy height is usually ellipsoidal (geoid offset tens of m); "
+              f"depth is relative to h_ref on that datum. {n_zero} coherent cells have h == 0 "
+              f"exactly (check for DEM voids).")
+    print(f"  Topography (varying_depth): h_ref={h_ref_m:.1f} m, (h - h_ref) in "
+          f"[{dz_min_obs_m:.1f}, {dz_max_obs_m:.1f}] m over {height_pts_m.size} coherent cells; "
+          f"effective depth = {depth_key} + (h - h_ref)")
+    return torch.tensor(dz_m, dtype=torch.float32)
+
+
 def _load_insar_inputs(config:dict):
     """
     Observation inputs for the LOS decoders, from EITHER an h5 'insar' block (MintPy
@@ -573,17 +701,7 @@ def _load_insar_inputs(config:dict):
     if 'insar' in args:
         # h5-native: derive points + per-point scaler from the SAME memoized loader the
         # dataset uses, so the dataset and the decoder agree on identical points exactly.
-        from datasets.preprocessing.insar_mintpy import load_insar_mintpy
-        ins = args['insar']
-        d = load_insar_mintpy(
-            ins['timeseries'], ins['geometry'], ins.get('mask'),
-            ins['lat0'], ins['lon0'], multilook=ins.get('multilook', 1),   # default 1 = no multilook
-            coh_valid_frac=ins.get('coh_valid_frac', 0.5), bbox=ins.get('bbox'), verbose=False,
-            standardization=ins.get('std_mode', 'global'), far_field=ins.get('far_field'),
-            stride=ins.get('stride', 1), offset=ins.get('offset', 0),   # UQ decimation (must match dataset)
-            bootstrap_k=ins.get('bootstrap_k'), bootstrap_block=ins.get('bootstrap_block', 3),
-            bootstrap_seed=ins.get('bootstrap_seed', 0),
-            ref_date=ins.get('ref_date'))          # temporal re-referencing (must match dataset)
+        d = _load_insar_data(config)
         x_east_m = torch.tensor(d.xE_pts.astype(np.float32)) * 1000.0   # km -> m
         y_north_m = torch.tensor(d.yN_pts.astype(np.float32)) * 1000.0
         los_E = torch.tensor(d.losE_pts[None, :]).float().to(DEVICE)
@@ -624,17 +742,7 @@ def _load_insar_grid_inputs(config:dict):
     x_mean, x_scale     : Tensor [1,1]      global z-score (DEVICE)
     Hd, Wd, n_cells     : ints
     """
-    from datasets.preprocessing.insar_mintpy import load_insar_mintpy
-    ins = config['arch']['args']['insar']
-    d = load_insar_mintpy(
-        ins['timeseries'], ins['geometry'], ins.get('mask'),
-        ins['lat0'], ins['lon0'], multilook=ins.get('multilook', 1),   # default 1 = no multilook
-        coh_valid_frac=ins.get('coh_valid_frac', 0.5), bbox=ins.get('bbox'), verbose=False,
-        standardization=ins.get('std_mode', 'global'), far_field=ins.get('far_field'),
-        stride=ins.get('stride', 1), offset=ins.get('offset', 0),   # UQ decimation (grid path)
-        bootstrap_k=ins.get('bootstrap_k'), bootstrap_block=ins.get('bootstrap_block', 3),
-        bootstrap_seed=ins.get('bootstrap_seed', 0),
-        ref_date=ins.get('ref_date'))          # temporal re-referencing (must match dataset)
+    d = _load_insar_data(config)
     Hd, Wd = d.mask_d.shape
     # CRITICAL: cell order here MUST match how the trainer flattens the input image
     # (torch `data.reshape(B, -1)`, i.e. C-order/row-major over Hd x Wd). flat() forces
@@ -705,7 +813,8 @@ class Physics_Mogi_LOS(Physics_Mogi):
         assert self.n_points == config['arch']['args']['input_dim'], (
             f"InSAR points N={self.n_points} != arch.args.input_dim="
             f"{config['arch']['args']['input_dim']}; they must match")
-        self.model = Mogi(x_east_m, y_north_m)
+        self.model = Mogi(x_east_m, y_north_m, dz_topo_m=_build_topo_offset(
+            config, self.z_phy_ranges, 'd', grid=False))
 
     def forward(self, z_phy:torch.Tensor, const:dict=None):
         z_phy_rescaled = self.rescale(z_phy)              # inherited from Physics_Mogi
@@ -746,7 +855,8 @@ class Physics_Okada_LOS(Physics_Okada):
         assert self.n_points == config['arch']['args']['input_dim'], (
             f"InSAR points N={self.n_points} != arch.args.input_dim="
             f"{config['arch']['args']['input_dim']}; they must match")
-        self.model = OkadaDike(x_east_m, y_north_m)
+        self.model = OkadaDike(x_east_m, y_north_m, dz_topo_m=_build_topo_offset(
+            config, self.z_phy_ranges, 'depth', grid=False))
 
         # km -> m parameters (inherited rescale() reads this attribute).
         self.km_params = ['xoff', 'yoff', 'depth', 'length', 'width']
@@ -773,7 +883,8 @@ class Physics_Mogi_LOS_Grid(Physics_Mogi):
             self.z_phy_ranges = json.load(f)
         (x_east_m, y_north_m, self.los_E, self.los_N, self.los_U,
          self.x_mean, self.x_scale, self.Hd, self.Wd, self.n_cells) = _load_insar_grid_inputs(config)
-        self.model = Mogi(x_east_m, y_north_m)
+        self.model = Mogi(x_east_m, y_north_m, dz_topo_m=_build_topo_offset(
+            config, self.z_phy_ranges, 'd', grid=True))
 
     def forward(self, z_phy:torch.Tensor, const:dict=None):
         z_phy_rescaled = self.rescale(z_phy)              # inherited from Physics_Mogi
@@ -798,7 +909,8 @@ class Physics_Okada_LOS_Grid(Physics_Okada):
             f"OkadaDike.run; got {list(self.z_phy_ranges.keys())}")
         (x_east_m, y_north_m, self.los_E, self.los_N, self.los_U,
          self.x_mean, self.x_scale, self.Hd, self.Wd, self.n_cells) = _load_insar_grid_inputs(config)
-        self.model = OkadaDike(x_east_m, y_north_m)
+        self.model = OkadaDike(x_east_m, y_north_m, dz_topo_m=_build_topo_offset(
+            config, self.z_phy_ranges, 'depth', grid=True))
         self.km_params = ['xoff', 'yoff', 'depth', 'length', 'width']
 
     def forward(self, z_phy:torch.Tensor, const:dict=None):
@@ -837,7 +949,8 @@ class Physics_Sun69_LOS(Physics_Sun69):
         assert self.n_points == config['arch']['args']['input_dim'], (
             f"InSAR points N={self.n_points} != arch.args.input_dim="
             f"{config['arch']['args']['input_dim']}; they must match")
-        self.model = Sun69(x_east_m, y_north_m)
+        self.model = Sun69(x_east_m, y_north_m, dz_topo_m=_build_topo_offset(
+            config, self.z_phy_ranges, 'depth', grid=False))
 
         # km -> m parameters (inherited rescale() reads this attribute).
         self.km_params = ['xcen', 'ycen', 'depth', 'radius']
@@ -865,7 +978,8 @@ class Physics_Sun69_LOS_Grid(Physics_Sun69):
             f"Sun69.run; got {list(self.z_phy_ranges.keys())}")
         (x_east_m, y_north_m, self.los_E, self.los_N, self.los_U,
          self.x_mean, self.x_scale, self.Hd, self.Wd, self.n_cells) = _load_insar_grid_inputs(config)
-        self.model = Sun69(x_east_m, y_north_m)
+        self.model = Sun69(x_east_m, y_north_m, dz_topo_m=_build_topo_offset(
+            config, self.z_phy_ranges, 'depth', grid=True))
         self.km_params = ['xcen', 'ycen', 'depth', 'radius']
 
     def forward(self, z_phy:torch.Tensor, const:dict=None):

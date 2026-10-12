@@ -155,6 +155,10 @@ class InSARData:
     x_mean_pts,x_scale_pts : [N]       per-point standardization (point/MLP path).
     x_mean_global,x_scale_global : float  global z-score (CNN/grid path).
     multilook,lat0,lon0 : echo of inputs.
+    height_grid_m : [Hd, Wd] or None   surface elevation of each cell, m (NaN where masked);
+                                       MintPy 'height' (usually ellipsoidal) or npz 'height_m'.
+                                       None when the geometry carries no height.
+    height_pts_m  : [N] or None        coherent-cell elevation, m (same order as xE_pts).
     """
     los_mm: np.ndarray
     mask_d: np.ndarray
@@ -179,6 +183,11 @@ class InSARData:
     lat0: float
     lon0: float
     extent_lonlat: tuple   # [lon_min, lon_max, lat_min, lat_max] of the coarse grid (deg)
+    # Surface elevation (m) for the topography correction; read whenever available, used
+    # only when the model config asks for it (arch.args.topography). Defaults keep older
+    # constructors valid.
+    height_grid_m: np.ndarray = None
+    height_pts_m: np.ndarray = None
 
 
 # --- block-multilook helpers ------------------------------------------------
@@ -254,6 +263,7 @@ def _multilook_2d(arr_2d, mask_2d, factor):
 
 # --- native .npz scene reader (local x/y frame, any grid size) ---------------
 NPZ_TRACKS = ('asc', 'desc')
+NPZ_JOINT_TRACK = 'joint'   # asc + desc stacked side by side (see _read_npz_joint_scene)
 
 
 def _read_npz_scene(npz_path, track, verbose=True):
@@ -268,14 +278,18 @@ def _read_npz_scene(npz_path, track, verbose=True):
       heading_<track>_deg          scalar or [H, W], flight heading, deg clockwise from N
       dates (optional)             [n] 'YYYYMMDD' / 'YYYY-MM-DD'; placeholders otherwise
       mask  (optional)             [H, W] bool, True = keep
+      height_m (optional)          [H, W] surface elevation, metres (topography correction)
 
     Inputs : npz_path str   path to the .npz
              track    str   'asc' or 'desc' (passed through the config 'geometry' key)
     Output : ts_cube_m [n, H, W] float32 (m), dates list[str] ISO, and a dict with
-             full-res east_km/north_km/inc_deg/az_deg [H, W] and mask [H, W] (or None).
+             full-res east_km/north_km/inc_deg/az_deg [H, W], mask [H, W] (or None) and
+             height_m [H, W] (or None).
              Rows are ordered NORTH -> SOUTH (MintPy convention) on return.
     """
     track = str(track).lower()
+    if track == NPZ_JOINT_TRACK:
+        return _read_npz_joint_scene(npz_path, verbose)
     if track not in NPZ_TRACKS:
         raise ValueError(f"For .npz input the 'geometry' key selects the track and must be "
                          f"one of {NPZ_TRACKS}; got {track!r}")
@@ -294,6 +308,7 @@ def _read_npz_scene(npz_path, track, verbose=True):
         heading_deg = np.asarray(f[head_key], dtype=np.float64)
         dates_raw = np.asarray(f['dates']) if 'dates' in f.files else None
         mask = np.asarray(f['mask'], dtype=bool) if 'mask' in f.files else None
+        height_m = np.asarray(f['height_m'], dtype=np.float64) if 'height_m' in f.files else None
     n_samples, n_rows, n_cols = ts_cube_m.shape
     if (y_m.size, x_m.size) != (n_rows, n_cols):
         raise ValueError(f"axis lengths (y={y_m.size}, x={x_m.size}) do not match "
@@ -311,6 +326,8 @@ def _read_npz_scene(npz_path, track, verbose=True):
     az_grid_deg = np.broadcast_to(90.0 - heading_deg, (n_rows, n_cols)).astype(np.float64)
     if mask is not None and mask.shape != (n_rows, n_cols):
         raise ValueError(f"npz mask shape {mask.shape} != grid {(n_rows, n_cols)}")
+    if height_m is not None and height_m.shape != (n_rows, n_cols):
+        raise ValueError(f"npz height_m shape {height_m.shape} != grid {(n_rows, n_cols)}")
 
     # Put row 0 = NORTH (MintPy convention) so the CNN image path and the map plots see the
     # same orientation as a MintPy cube. Coordinates flip with the data, so physics is unaffected.
@@ -319,6 +336,7 @@ def _read_npz_scene(npz_path, track, verbose=True):
         east_km, north_km = east_km[::-1, :], north_km[::-1, :]
         inc_grid_deg, az_grid_deg = inc_grid_deg[::-1, :], az_grid_deg[::-1, :]
         mask = mask[::-1, :] if mask is not None else None
+        height_m = height_m[::-1, :] if height_m is not None else None
 
     if dates_raw is not None:
         dates = [(s.decode() if isinstance(s, (bytes, bytearray)) else str(s)).replace('-', '')
@@ -334,8 +352,43 @@ def _read_npz_scene(npz_path, track, verbose=True):
 
     geom = dict(east_km=np.ascontiguousarray(east_km), north_km=np.ascontiguousarray(north_km),
                 inc_deg=np.ascontiguousarray(inc_grid_deg), az_deg=np.ascontiguousarray(az_grid_deg),
-                mask=None if mask is None else np.ascontiguousarray(mask))
+                mask=None if mask is None else np.ascontiguousarray(mask),
+                height_m=None if height_m is None else np.ascontiguousarray(height_m))
     return np.ascontiguousarray(ts_cube_m), dates, geom
+
+
+def _read_npz_joint_scene(npz_path, verbose=True):
+    """
+    Joint asc + desc scene: both tracks of the same npz placed SIDE BY SIDE on one
+    [n, H, 2W] grid (columns 0..W-1 = asc, W..2W-1 = desc).
+
+    Every cell keeps its own coordinates, incidence, azimuth (so its own LOS unit vector)
+    and height, so the point-path physics sees the two tracks as one stacked point set
+    (N = 2 * H * W), exactly like the classical joint export (asc points, then desc
+    points, each with its own LOS vector). The two halves are NOT spatial neighbours:
+    only multilook = 1 is allowed (enforced in load_insar_mintpy), and the grid/CNN path
+    must not be used with it.
+
+    Inputs : npz_path str, verbose bool.   Output: same as _read_npz_scene.
+    """
+    asc_cube_m, asc_dates, asc_geom = _read_npz_scene(npz_path, 'asc', verbose)
+    desc_cube_m, desc_dates, desc_geom = _read_npz_scene(npz_path, 'desc', verbose=False)
+    if asc_dates != desc_dates or asc_cube_m.shape != desc_cube_m.shape:
+        raise ValueError(f"{npz_path}: asc/desc dates or grid shapes differ; cannot stack")
+    joint_cube_m = np.concatenate([asc_cube_m, desc_cube_m], axis=2)
+    joint_geom = {}
+    for key, asc_value in asc_geom.items():
+        desc_value = desc_geom[key]
+        if asc_value is None and desc_value is None:
+            joint_geom[key] = None
+        elif key == 'mask' and (asc_value is None) != (desc_value is None):
+            raise ValueError(f"{npz_path}: mask present for one track only")
+        else:
+            joint_geom[key] = np.ascontiguousarray(np.concatenate([asc_value, desc_value], axis=1))
+    if verbose:
+        print(f"  JOINT asc+desc: stacked side by side -> shape={joint_cube_m.shape} "
+              f"(N = 2 x {asc_cube_m.shape[1] * asc_cube_m.shape[2]} points, own LOS vector each)")
+    return np.ascontiguousarray(joint_cube_m), asc_dates, joint_geom
 
 
 # --- main loader (memoized) -------------------------------------------------
@@ -398,7 +451,7 @@ def load_insar_mintpy(timeseries_h5, geometry_h5, mask_h5, lat0, lon0,
     ---------
     If `timeseries_h5` ends in '.npz', the scene is read natively by _read_npz_scene (local
     x/y metres, any grid size, no resampling). Then `geometry_h5` is the track token 'asc' or
-    'desc', `mask_h5` must be None (put an optional 'mask' array in the npz instead), `bbox`
+    'desc' (or 'joint' = both stacked side by side, multilook 1 only), `mask_h5` must be None (put an optional 'mask' array in the npz instead), `bbox`
     is not supported, lat0/lon0 are ignored (the npz frame is already local), and
     `extent_lonlat` holds the LOCAL km extent (x_min, x_max, y_min, y_max), not degrees.
 
@@ -420,6 +473,13 @@ def load_insar_mintpy(timeseries_h5, geometry_h5, mask_h5, lat0, lon0,
                              "array inside the npz instead")
         if bbox is not None:
             raise NotImplementedError("bbox (lon/lat crop) is not supported for .npz input")
+        if geom_path == NPZ_JOINT_TRACK and int(multilook) != 1:
+            # The asc and desc halves sit side by side; a block mean would mix the two tracks.
+            raise ValueError("geometry 'joint' (asc+desc stacked) requires multilook = 1")
+        if geom_path == NPZ_JOINT_TRACK and (int(stride) > 1 or bootstrap_k is not None):
+            # Row-major striding / block tiles over the 2W-wide grid would stripe-sample or
+            # straddle the asc|desc seam; per-track UQ decimation is not implemented.
+            raise ValueError("geometry 'joint' does not support stride > 1 or bootstrap_k")
     else:
         geom_path = geometry_h5 if os.path.isabs(geometry_h5) else os.path.join(PARENT_DIR, geometry_h5)
     mask_path = mask_h5 if (mask_h5 and os.path.isabs(mask_h5)) else (
@@ -616,14 +676,23 @@ def load_insar_mintpy(timeseries_h5, geometry_h5, mask_h5, lat0, lon0,
 
     if is_npz:
         inc_full, az_full = npz_geom['inc_deg'], npz_geom['az_deg']
+        height_full = npz_geom.get('height_m')
     else:
         with h5py.File(geom_path, 'r') as f:
             inc_full = np.array(f['incidenceAngle'], dtype=np.float64)[row0:row1, col0:col1]
             az_full = np.array(f['azimuthAngle'], dtype=np.float64)[row0:row1, col0:col1]
+            # DEM height (m) for the optional topography correction. MintPy 'height' is
+            # normally height above the WGS84 ellipsoid, not the geoid (datum caveat).
+            height_full = (np.array(f['height'], dtype=np.float64)[row0:row1, col0:col1]
+                           if 'height' in f else None)
     lon_d = _multilook_2d(lon_grid, keep_mask, multilook)
     lat_d = _multilook_2d(lat_grid, keep_mask, multilook)
     inc_d = _multilook_2d(inc_full, keep_mask, multilook)
     az_d = _multilook_2d(az_full, keep_mask, multilook)
+    # Elevation is block-averaged exactly like the geometry, so each coarse cell's height
+    # is the mean over the same coherent pixels as its LOS value (as iokada's bin means).
+    height_d = (_multilook_2d(height_full, keep_mask, multilook)
+                if height_full is not None else None)
     rows_d, cols_d = mask_d.shape
 
     # Geographic extent of the coarse grid (the multilook crops to whole blocks), for plots.
@@ -731,8 +800,13 @@ def load_insar_mintpy(timeseries_h5, geometry_h5, mask_h5, lat0, lon0,
         x_mean_global=x_mean_global, x_scale_global=x_scale_global,
         multilook=int(multilook), lat0=float(lat0), lon0=float(lon0),
         extent_lonlat=extent_lonlat,
+        height_grid_m=None if height_d is None else np.where(mask_d, height_d, np.nan).astype(np.float32),
+        height_pts_m=None if height_d is None else height_d[coh_rows, coh_cols].astype(np.float32),
     )
     _CACHE[cache_key] = data
     if verbose:
+        if height_d is not None:
+            print(f"  Height (m) at coherent cells: min={np.nanmin(data.height_pts_m):.1f}, "
+                  f"max={np.nanmax(data.height_pts_m):.1f}")
         print(f"  Done. N points = {n_points}, grid = {rows_d}x{cols_d}.")
     return data

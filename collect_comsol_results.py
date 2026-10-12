@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # Usage:       python collect_comsol_results.py [--saved-root saved/comsol_wk6]
 #                  [--truth data/comsol/wk6_chambers_inversion_20260928/metadata/wk6_truth.csv]
-#                  [--outdir figures/comsol_wk6] [--overwrite]
+#                  [--outdir figures/comsol_wk6] [--overwrite] [--figures]
 # Description: Collect the per-chamber PILA Mogi inversions of the COMSOL wk6 catalogue
 #              (generate_comsol_jobs.py) and compare them with the COMSOL truth: one CSV row
 #              per run (recovered, truth, errors, chamber shape, topography), a grouped summary
@@ -37,7 +37,7 @@ import pandas as pd
 # Reference categorical palette, slots 1-2 (validated pair); markers give a second encoding.
 TOPO_STYLE = {'flat': dict(color='#2a78d6', marker='o', label='Flat surface'),
               'cone': dict(color='#eb6834', marker='^', label='Cone (1 km high)')}
-RUN_NAME_PATTERN = re.compile(r'comsol_wk6_cid(\d+)_(flat|cone)_(asc|desc)_mogi')
+RUN_NAME_PATTERN = re.compile(r'comsol_wk6_cid(\d+)_(flat|cone)_(asc|desc|joint)_mogi(?:_topo)?')   # _topo = topography runs
 BOUND_LINE_PATTERN = re.compile(r'^\s+(\w+)\s+=\s+([-+\d.eE]+)\s+\[', re.M)
 
 
@@ -87,7 +87,8 @@ def add_truth_and_errors(runs, truth):
     """Join the COMSOL truth on (cid, surface) and compute errors (depth %, dV %, offset m)."""
     truth_cols = ['cid', 'surface', 'kind', 'A', 'amp', 'draw', 'elong',
                   'z_centroid_m', 'height_m', 'dV_cavity_m3', 'w_max_m']
-    table = runs.merge(truth[truth_cols], on=['cid', 'surface'], how='left', validate='one_to_one')
+    table = runs.merge(truth[truth_cols], on=['cid', 'surface'], how='left',
+                        validate='many_to_one')   # asc + desc runs share one truth row
     if table['z_centroid_m'].isna().any():
         bad = table.loc[table['z_centroid_m'].isna(), ['cid', 'surface']].values.tolist()
         raise ValueError(f"runs without a truth row: {bad}")
@@ -100,7 +101,7 @@ def add_truth_and_errors(runs, truth):
     table['depth_err_pct'] = 100.0 * table['depth_err_km'] / table['depth_true_km']
     table['dV_err_pct'] = 100.0 * (table['dV_m3'] / table['dV_cavity_m3'] - 1.0)
     table['offset_m'] = 1000.0 * np.hypot(table['xcen_km'], table['ycen_km'])  # axis at (0,0)
-    return table.sort_values(['surface', 'A', 'amp', 'cid']).reset_index(drop=True)
+    return table.sort_values(['track', 'surface', 'A', 'amp', 'cid']).reset_index(drop=True)
 
 
 def plot_errors_vs_elongation(table, out_stem):
@@ -177,6 +178,9 @@ def main():
     parser.add_argument('--truth', default='data/comsol/wk6_chambers_inversion_20260928/metadata/wk6_truth.csv')
     parser.add_argument('--outdir', default='figures/comsol_wk6')
     parser.add_argument('--overwrite', action='store_true', help='allow replacing existing outputs')
+    parser.add_argument('--figures', action='store_true',
+                        help='also write the summary scatter figures (off by default: maps only, '
+                             'per user request; they also pool asc + desc tracks)')
     args = parser.parse_args()
     t0 = time.time()
 
@@ -194,7 +198,7 @@ def main():
     runs = collect_runs(args.saved_root)
     if runs.empty:
         raise RuntimeError(f"no finished runs found under {args.saved_root}")
-    print(f"  Found {len(runs)} runs ({runs['surface'].value_counts().to_dict()}), "
+    print(f"  Found {len(runs)} runs ({runs.groupby(['track', 'surface']).size().to_dict()}), "
           f"railed: {int(runs['railed'].sum())}")
 
     # --- [3/4] Join truth + errors, write tables ---
@@ -205,12 +209,13 @@ def main():
     summary_csv = os.path.join(args.outdir, 'comsol_wk6_summary.csv')
     figure_stems = [os.path.join(args.outdir, 'comsol_wk6_errors_vs_elongation'),
                     os.path.join(args.outdir, 'comsol_wk6_recovered_vs_true')]
-    outputs = [results_csv, summary_csv] + [f'{stem}.png' for stem in figure_stems]
+    outputs = [results_csv, summary_csv] + ([f'{stem}.png' for stem in figure_stems]
+                                            if args.figures else [])
     existing = [path for path in outputs if os.path.exists(path)]
     if existing and not args.overwrite:
         raise FileExistsError(f"outputs exist (pass --overwrite to replace): {existing}")
     table.to_csv(results_csv, index=False, float_format='%.6g')
-    summary = (table.groupby(['surface', 'A'])
+    summary = (table.groupby(['track', 'surface', 'A'])
                .agg(n=('cid', 'size'),
                     depth_err_pct_median=('depth_err_pct', 'median'),
                     depth_err_pct_min=('depth_err_pct', 'min'),
@@ -223,9 +228,12 @@ def main():
     print(summary.to_string(index=False))
 
     # --- [4/4] Figures ---
-    print(f"[4/4] Writing figures to {args.outdir} ...")
-    plot_errors_vs_elongation(table, figure_stems[0])
-    plot_recovered_vs_true(table, figure_stems[1])
+    if args.figures:
+        print(f"[4/4] Writing figures to {args.outdir} ...")
+        plot_errors_vs_elongation(table, figure_stems[0])
+        plot_recovered_vs_true(table, figure_stems[1])
+    else:
+        print("[4/4] Skipping summary figures (pass --figures to write them)")
     print(f"Done in {time.time() - t0:.1f}s. Output saved to {args.outdir}/")
 
 
