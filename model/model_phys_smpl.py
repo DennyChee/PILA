@@ -893,6 +893,68 @@ class Physics_Mogi_LOS_Grid(Physics_Mogi):
         return (d_los - self.x_mean.to(enu.device)) / self.x_scale.to(enu.device)  # [batch, Ncells]
 
 
+MOGI_PARAM_NAMES = ['xcen', 'ycen', 'd', 'dV']
+
+
+def multimogi_param_names(n_sources:int):
+    """
+    Latent/physical parameter names of a K-source Mogi decoder, in z_phy order:
+    [xcen_1, ycen_1, d_1, dV_1, xcen_2, ...]. Units after rescale: m, m, m, m^3.
+    """
+    return [f'{name}_{k + 1}' for k in range(n_sources) for name in MOGI_PARAM_NAMES]
+
+
+class _MultiMogiMixin:
+    """
+    K additive Mogi sources on top of a single-source Mogi LOS decoder.
+
+    z_phy [B, 4K] is laid out as K blocks of the mogi_paras JSON order (xcen, ycen, d, dV).
+    Every source shares the same prior ranges, so the inherited rescale() is applied to the
+    [B*K, 4] view. Surface LOS is linear in each source's field, so the summed field is the
+    exact superposition (valid for well-separated sources, Pascal et al. 2014).
+    With K = 1 the output is bit-for-bit the single-source decoder's output.
+    """
+
+    def _init_multi(self, config:dict, n_obs:int):
+        self.n_sources = int(config['arch']['args'].get('n_sources', 1))
+        dim_z_phy = config['arch']['phys_vae']['dim_z_phy']
+        if dim_z_phy != 4 * self.n_sources:
+            raise ValueError(f"MultiMogi_LOS: dim_z_phy={dim_z_phy} must equal 4 * n_sources "
+                             f"(n_sources={self.n_sources})")
+        if list(self.z_phy_ranges.keys()) != MOGI_PARAM_NAMES:
+            raise ValueError(f"MultiMogi_LOS expects mogi_paras keys {MOGI_PARAM_NAMES}, "
+                             f"got {list(self.z_phy_ranges.keys())}")
+        self.n_obs = n_obs
+        self.param_names = multimogi_param_names(self.n_sources)
+
+    def per_source_los_mm(self, z_phy:torch.Tensor):
+        """Unsummed LOS of every source, mm (+ toward satellite): [B, K, N_obs]."""
+        n_batch = z_phy.shape[0]
+        z_flat = z_phy.reshape(n_batch * self.n_sources, len(MOGI_PARAM_NAMES))
+        z_phy_rescaled = self.rescale(z_flat)                     # dict of [B*K] tensors (m, m^3)
+        enu = self.model.run(**z_phy_rescaled)                    # [B*K, 3*N_obs] mm
+        d_los = project_enu_to_los(enu, self.los_E, self.los_N, self.los_U, self.n_obs)
+        return d_los.reshape(n_batch, self.n_sources, self.n_obs)
+
+    def forward(self, z_phy:torch.Tensor, const:dict=None):
+        d_los = self.per_source_los_mm(z_phy).sum(dim=1)          # superposition, [B, N_obs] mm
+        return (d_los - self.x_mean.to(d_los.device)) / self.x_scale.to(d_los.device)
+
+
+class Physics_MultiMogi_LOS(_MultiMogiMixin, Physics_Mogi_LOS):
+    """K-source Mogi LOS decoder on coherent points (MLP path). See _MultiMogiMixin."""
+    def __init__(self, config:dict):
+        Physics_Mogi_LOS.__init__(self, config)
+        self._init_multi(config, self.n_points)
+
+
+class Physics_MultiMogi_LOS_Grid(_MultiMogiMixin, Physics_Mogi_LOS_Grid):
+    """K-source Mogi LOS decoder on the whole grid (CNN path). See _MultiMogiMixin."""
+    def __init__(self, config:dict):
+        Physics_Mogi_LOS_Grid.__init__(self, config)
+        self._init_multi(config, self.n_cells)
+
+
 class Physics_Okada_LOS_Grid(Physics_Okada):
     """
     Full-field (CNN-path) opening-only Okada LOS decoder over the WHOLE coarse grid.
@@ -996,7 +1058,7 @@ def _maybe_set_insar_input_dim(config:dict):
     hardcode N (which depends on the multilook factor and mask). No-op otherwise.
     """
     args = config['arch']['args']
-    if args.get('physics') not in ('Mogi_LOS', 'Okada_LOS', 'Sun69_LOS') or 'insar' not in args:
+    if args.get('physics') not in ('Mogi_LOS', 'MultiMogi_LOS', 'Okada_LOS', 'Sun69_LOS') or 'insar' not in args:
         return
     from datasets.preprocessing.insar_mintpy import load_insar_mintpy
     ins = args['insar']
@@ -1114,6 +1176,10 @@ class PHYS_VAE_SMPL(nn.Module):
             if config['arch']['args'].get('encoder_type', 'mlp') == 'cnn':
                 return Physics_Mogi_LOS_Grid(config)
             return Physics_Mogi_LOS(config)
+        elif config['arch']['args']['physics'] == 'MultiMogi_LOS':
+            if config['arch']['args'].get('encoder_type', 'mlp') == 'cnn':
+                return Physics_MultiMogi_LOS_Grid(config)
+            return Physics_MultiMogi_LOS(config)
         elif config['arch']['args']['physics'] == 'Okada_LOS':
             if config['arch']['args'].get('encoder_type', 'mlp') == 'cnn':
                 return Physics_Okada_LOS_Grid(config)

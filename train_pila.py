@@ -35,7 +35,8 @@ def set_seed(seed):
 set_seed(SEED)  # default; main() re-seeds from config['seed'] if provided
 
 
-def log_compute_usage(config, logger, data_loader, model, device, data_load_sec, train_sec):
+def log_compute_usage(config, logger, data_loader, model, device, data_load_sec, train_sec,
+                      timing_summary=None, warm_start_info=None):
     """
     Record compute/scalability stats for the run and write them to compute_usage.json.
 
@@ -61,7 +62,19 @@ def log_compute_usage(config, logger, data_loader, model, device, data_load_sec,
         'samples_per_sec': round(n_samples * n_train_epochs / max(train_sec, 1e-9), 1),
         'peak_rss_mb': round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 1),
         'gpu_peak_mb': round(torch.cuda.max_memory_allocated() / 1e6, 1) if torch.cuda.is_available() else 0.0,
+        'n_sources': int(args.get('n_sources', 1)),
+        'dim_z_phy': config['arch']['phys_vae']['dim_z_phy'],
+        'seed': config.config.get('seed') if hasattr(config, 'config') else None,
     }
+    # Sequential multi-source warm start (K-1 -> K) cost and where the new source started.
+    if warm_start_info is not None:
+        usage['warm_start_sec'] = round(warm_start_info['warm_start_sec'], 3)
+        usage['warm_start_from'] = warm_start_info['init_from']
+        usage['warm_start_new_source'] = warm_start_info['new_source_start']
+    # Per-phase training wall-clock (utils/timing.PhaseTimer): seconds, fractions, ms per call and
+    # per sample, so e.g. physics_decode cost can be compared across K = 1, 2, 3 sources.
+    if timing_summary:
+        usage['timing'] = timing_summary
     # InSAR multilook geometry (memoized loader -> instant) for the scene/grid context.
     ins = args.get('insar')
     if ins is not None:
@@ -113,6 +126,19 @@ def generate_insar_figures(config, logger):
         logger.warning(f"Auto figures: model_best.pth not found at {resume_path}; skipping.")
         return
 
+    # K-source Mogi: plot_insar_results.py assumes one 4-parameter source, so instead dump the
+    # per-acquisition, per-source fit (fit_K<k>.npz + infer_usage_K<k>.json) used by the
+    # sequential source-count selection. Isolated subprocess, never fails the training run.
+    if physics == 'MultiMogi_LOS':
+        dump_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dump_multisource_fit.py')
+        cmd = [sys.executable, dump_script, '--resume', resume_path]
+        logger.info(f"Dumping per-source fit: {' '.join(cmd)}")
+        try:
+            subprocess.run(cmd, check=True, cwd=os.path.dirname(dump_script))
+        except (subprocess.CalledProcessError, OSError) as exc:
+            logger.warning(f"Per-source dump failed ({exc}); run {' '.join(cmd)} manually.")
+        return
+
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'plot_insar_results.py')
     cmd = [sys.executable, script, '--resume', resume_path]
     logger.info(f"Generating verification figures: {' '.join(cmd)}")
@@ -162,6 +188,26 @@ def _propagate_insar_uq(cfg):
             block.update(uq_keys)
 
 
+def _check_insar_scene_paths(cfg):
+    """
+    Hard-fail if the decoder's scene (arch.args.insar.timeseries) is not the training scene
+    (data_loader.args.insar.timeseries). The decoder standardizes its output with the mean/std
+    of ITS scene, so a mismatch silently rescales every predicted amplitude (the 2026-09-07
+    vbICA campaign ran 11 cubes against marapi_mogi_rising_combined's 141 mm std this way).
+    No-op when either block is absent (GNSS / legacy JSON runs).
+    """
+    arch_ins = cfg.get('arch', {}).get('args', {}).get('insar')
+    train_ins = cfg.get('data_loader', {}).get('args', {}).get('insar')
+    if not isinstance(arch_ins, dict) or not isinstance(train_ins, dict):
+        return
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    resolve = lambda path: os.path.realpath(os.path.join(project_dir, path))   # abs paths pass through
+    if resolve(arch_ins['timeseries']) != resolve(train_ins['timeseries']):
+        raise ValueError("arch.args.insar.timeseries != data_loader.args.insar.timeseries:\n"
+                         f"  decoder: {arch_ins['timeseries']}\n  data:    {train_ins['timeseries']}\n"
+                         "The decoder would standardize with the wrong scene's mean/std.")
+
+
 def main(config):
     logger = config.get_logger('train')
 
@@ -174,6 +220,7 @@ def main(config):
 
     # Keep all insar blocks consistent before any loader/model reads them (UQ decimation).
     _propagate_insar_uq(config.config)
+    _check_insar_scene_paths(config.config)
     ins_dbg = config.config.get('arch', {}).get('args', {}).get('insar', {})
     print(f"  InSAR UQ config: multilook={ins_dbg.get('multilook', 1)}, "
           f"stride={ins_dbg.get('stride', 1)}, offset={ins_dbg.get('offset', 0)}")
@@ -196,6 +243,20 @@ def main(config):
     # Build model architecture and log
     model = PHYS_VAE_SMPL(config)
     logger.info(model)
+
+    # Sequential multi-source: warm-start a K-source MultiMogi model from the (K-1) fit.
+    warm_start_info = None
+    if config['arch']['phys_vae'].get('init_from'):
+        from utils.warm_start import warm_start_multimogi
+        warm_start_info = warm_start_multimogi(model, config, data_loader, logger)
+    elif config['arch']['phys_vae'].get('init_sources'):
+        # Explicit start for a fresh K-source network (init test): sources at the given (x, y, d, dV).
+        from utils.warm_start import warm_start_explicit_sources
+        warm_start_info = warm_start_explicit_sources(model, config, logger)
+    elif config['arch']['phys_vae'].get('seed_init'):
+        # Opt-in K=1 start (depth / residual-peak seeding); absent in the standard recipe.
+        from utils.warm_start import seed_first_source
+        seed_first_source(model, config, data_loader, logger)
 
     # Prepare for (multi-device) GPU training
     device, device_ids = prepare_device(config['n_gpu'])
@@ -231,7 +292,9 @@ def main(config):
     train_sec = time.time() - t_train0
 
     # Record compute/scalability usage for this run.
-    log_compute_usage(config, logger, data_loader, model, device, data_load_sec, train_sec)
+    timing_summary = trainer.timer.summary(n_samples_seen=trainer.n_samples_seen) if trainer.timer.enabled else None
+    log_compute_usage(config, logger, data_loader, model, device, data_load_sec, train_sec,
+                      timing_summary=timing_summary, warm_start_info=warm_start_info)
 
     # Generate observed / model-fit / residual figures for visual inspection.
     generate_insar_figures(config, logger)

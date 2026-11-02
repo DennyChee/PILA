@@ -9,6 +9,7 @@
 #                fig_uncertainty_zscores  (truth - mean)/sigma per parameter vs N(0,1)
 #                fig_examples             input | predicted Mogi sum | residual, with true
 #                                         (black) and predicted (coloured by P) sources
+#                fig_detection_vs_snr     Test 2: recall vs peak ratio + K=0 false-alarm rate
 # Scientific notes:
 #   * Predicted sources are matched to true sources with the same Hungarian cost used in
 #     training; "found" = matched query with P(exist) > 0.5.
@@ -200,6 +201,53 @@ def fig_examples(res, meta, out_dir, n_per_k=2):
     plt.close(fig)
 
 
+def detection_vs_snr(res, label, out_dir):
+    """Test 2: K=0 false-alarm rate and per-source recall binned by peak ratio (max|LOS| / sigma_ref).
+
+    A K=0 scene is a false alarm if any query has P(exist) > 0.5. Recall in a bin is the fraction
+    of true sources in that peak-ratio bin whose matched query has P(exist) > 0.5.
+    """
+    pred_k = (res['p_exist'] > 0.5).sum(1)
+    is_k0 = res['k'] == 0
+    false_alarm_rate = float(np.mean(pred_k[is_k0] > 0)) if is_k0.any() else None
+    # Per true source: (peak ratio, detected?)
+    peak_all, detected_all = [], []
+    for b in range(len(res['k'])):
+        for j in range(int(res['k'][b])):
+            q = int(res['assigned'][b, j])
+            peak_all.append(res['peak_ratio'][b, j])
+            detected_all.append(res['p_exist'][b, q] > 0.5)
+    peak_all, detected_all = np.array(peak_all), np.array(detected_all, float)
+    edges = np.array([0, 0.5, 1, 2, 3, 5, 10, 20, 50, np.inf])     # peak / sigma bins (dimensionless)
+    bins = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        sel = (peak_all >= lo) & (peak_all < hi)
+        # None (not NaN) for empty bins so metrics.json stays valid strict JSON
+        bins.append({'lo': float(lo), 'hi': float(hi), 'n': int(sel.sum()),
+                     'recall': float(detected_all[sel].mean()) if sel.any() else None,
+                     'median_peak': float(np.median(peak_all[sel])) if sel.any() else None})
+    # Max P(exist) on K=0 scenes: how close the model gets to a false alarm
+    k0_max_p = res['p_exist'][is_k0].max(1) if is_k0.any() else np.array([])
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    # Plot each bin at the median peak ratio of its sources (open-ended bins have no natural centre)
+    filled = [b for b in bins if b['n']]
+    axes[0].plot([b['median_peak'] for b in filled], [b['recall'] for b in filled], 'o-')
+    for b in filled:
+        axes[0].text(b['median_peak'], -0.06, f"n={b['n']}", ha='center', fontsize=8)
+    axes[0].set_xscale('log'); axes[0].set_ylim(-0.1, 1.05)
+    axes[0].set_xlabel('Peak ratio max|LOS| / σ_ref (dimensionless)'); axes[0].set_ylabel('Recall (P(exist) > 0.5)')
+    axes[0].set_title('Detection recall vs source amplitude / noise')
+    if len(k0_max_p):
+        axes[1].hist(k0_max_p, bins=np.linspace(0, 1, 21))
+        axes[1].axvline(0.5, color='k', ls='--', label='detection threshold 0.5')
+        axes[1].legend()
+    axes[1].set_xlabel('Max P(exist) over queries'); axes[1].set_ylabel('K=0 scenes')
+    fa_text = f'{false_alarm_rate:.1%}' if false_alarm_rate is not None else 'n/a'
+    axes[1].set_title(f'K=0 scenes: false-alarm rate {fa_text} (n={int(is_k0.sum())})')
+    plt.tight_layout(); fig.savefig(os.path.join(out_dir, 'fig_detection_vs_snr.png'), dpi=150); plt.close(fig)
+    return false_alarm_rate, bins
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run', required=True, help='run dir with config.json and checkpoints')
@@ -237,6 +285,7 @@ def main():
     fig_recovery(found_true, found_pred, peak, out_dir)
     coverage = fig_zscores(z_scores, out_dir)
     fig_examples(res, meta, out_dir)
+    false_alarm_rate, recall_bins = detection_vs_snr(res, label, out_dir)
 
     pred_k = (res['p_exist'] > 0.5).sum(1)
     loc_err = np.linalg.norm(found_pred[:, :2] - found_true[:, :2], axis=1)
@@ -253,14 +302,17 @@ def main():
         'median_log10dV_err': float(np.median(np.abs(np.log10(np.abs(found_pred[:, 3]))
                                                      - np.log10(np.abs(found_true[:, 3]))))),
         'sign_accuracy': float(np.mean(np.sign(found_pred[:, 3]) == np.sign(found_true[:, 3]))),
+        'k0_false_alarm_rate': false_alarm_rate, 'recall_by_peak_ratio': recall_bins,
         'uncertainty_coverage': coverage, 'confusion_matrix': mat.tolist(),
     }
     with open(os.path.join(out_dir, 'metrics.json'), 'w') as f:
         json.dump(metrics, f, indent=2)
     print("[4/4] Summary:")
     for key in ['count_accuracy', 'recall', 'existence_ece', 'median_loc_err_km', 'p90_loc_err_km',
-                'median_depth_err_km', 'median_log10dV_err', 'sign_accuracy']:
-        print(f"  {key:22s} {metrics[key]:.4f}")
+                'median_depth_err_km', 'median_log10dV_err', 'sign_accuracy', 'k0_false_alarm_rate']:
+        print(f"  {key:22s} {metrics[key]:.4f}" if metrics[key] is not None else f"  {key:22s} n/a")
+    print("  recall by peak ratio: " + ", ".join(f"[{b['lo']:g},{b['hi']:g}) {b['recall']:.2f} (n={b['n']})"
+                                                for b in recall_bins if b['n']))
     print(f"Done. Output saved to {out_dir}/")
 
 
