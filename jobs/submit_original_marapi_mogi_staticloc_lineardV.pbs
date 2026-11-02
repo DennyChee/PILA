@@ -1,0 +1,61 @@
+#!/bin/bash
+# Usage:       qsub jobs/submit_original_marapi_mogi_staticloc_lineardV.pbs
+# Description: TRUE ORIGINAL PILA baseline for the linear-dV Mogi test: physics KL is
+#              NOT in the loss (use_kl_term_z_phy=false -> beta_z_phy=0, deterministic
+#              z_phy), i.e. reconstruction-only training exactly as the repo's *_base
+#              configs. This is the real reference for "does the temporal prior beat
+#              production PILA?". train -> dump per-epoch u-space series -> plot vs truth.
+# Date:        2026-07-09
+#PBS -N orig_staticloc
+#PBS -P eos_btaisne
+#PBS -q qintel_wfly
+#PBS -l nodes=1:ppn=8
+#PBS -l walltime=12:00:00
+#PBS -l mem=16gb
+#PBS -j oe
+#PBS -o logs/orig_staticloc_pbs.log
+
+set -e
+cd "$PBS_O_WORKDIR"
+
+# --- Environment (project env is 'pila', NOT base) ---
+source /eos-rs/miniconda3/etc/profile.d/conda.sh
+conda activate pila
+export PYTHONPATH="${PYTHONPATH}:$PBS_O_WORKDIR"
+
+echo "[orig_staticloc] Host: $(hostname)  Env: $CONDA_DEFAULT_ENV  Workdir: $PBS_O_WORKDIR"
+echo "[orig_staticloc] Start: $(date)"
+
+# --- Named paths (same cube as the temporal-prior run) ---
+CONFIG="configs/synth/marapi_mogi_staticloc_lineardV_original.json"
+SAVE_DIR="saved/original_marapi_mogi_staticloc_lineardV/run"
+TRUTH_JSON="synthetic/cubes/marapi_mogi_staticloc_lineardV/marapi_mogi_staticloc_lineardV_truth.json"
+SERIES_CSV="$SAVE_DIR/uspace_series.csv"
+OUT_STEM="$SAVE_DIR/param_recovery_original_staticloc_lineardV"
+
+# --- Step 1/3: single-run training, reconstruction only (no physics KL) ---
+echo "[orig_staticloc] Step 1/3: training (original PILA, KL off)..."
+python train_pila.py --config "$CONFIG"
+
+# --- Step 2/3: locate the freshly-trained checkpoint (newest model_best.pth) ---
+CKPT="$(find "$SAVE_DIR" -name model_best.pth -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
+if [ -z "$CKPT" ]; then
+  echo "[orig_staticloc] ERROR: no model_best.pth under $SAVE_DIR" >&2
+  exit 1
+fi
+echo "[orig_staticloc] Checkpoint: $CKPT"
+
+# --- Step 2b: dump the per-epoch u-space series ---
+echo "[orig_staticloc] Step 2/3: dumping per-epoch u-space series..."
+python dump_uspace_series.py --config "$CONFIG" --resume "$CKPT" --out "$SERIES_CSV"
+
+# --- Step 3/3: overlay recovered per-epoch parameters vs synthetic ground truth ---
+echo "[orig_staticloc] Step 3/3: plotting recovered vs truth..."
+python plot_iterprior_vs_truth.py \
+  --series "$SERIES_CSV" \
+  --truth "$TRUTH_JSON" \
+  --out "$OUT_STEM" \
+  --label "Original PILA (no KL), staticloc linear dV @13dB"
+
+echo "[orig_staticloc] Param-recovery figure: $PBS_O_WORKDIR/${OUT_STEM}.png"
+echo "[orig_staticloc] Finished: $(date)"

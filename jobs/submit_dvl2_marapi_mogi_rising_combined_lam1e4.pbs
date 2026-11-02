@@ -1,0 +1,65 @@
+#!/bin/bash
+# Usage:       qsub jobs/submit_dvl2_marapi_mogi_rising_combined_lam1e4.pbs
+# Description: dV-L2 (QUADRATIC) sparsity penalty, lambda=10000. Switch from L1 to L2: crushes saturated (z->0/1) plateau spikes ~6x harder than the genuine rise, to kill the early-epoch dV fluctuations L1 left behind., on the SIGMOID-ramp dV synthetic cube
+#              (marapi_mogi_rising_combined: dV plateaus near 1e6 for early epochs
+#              then ramps sigmoidally to 8e7). Part-A dV-sparsity sanity check re-run
+#              with an increased lambda. The dV-L1 penalty REPLACES the old iterprior
+#              approach: this is a single train_pila.py run with only dv_l1_weight
+#              active (temporal_prior / iterative_refinement / ema_prior all OFF).
+#              Compare recovered dV vs the baseline overlay: quiescent early epochs
+#              should collapse to dV~=0 (depth stops railing deep) while the late
+#              high-dV rise is still recovered. train -> dump u-space series -> plot.
+# Date:        2026-07-10
+#PBS -N dvl2_1e4
+#PBS -P eos_btaisne
+#PBS -q qintel_wfly
+#PBS -l nodes=1:ppn=8
+#PBS -l walltime=12:00:00
+#PBS -l mem=16gb
+#PBS -j oe
+#PBS -o logs/dvl2_combined_lam1e4_pbs.log
+
+set -e
+cd "$PBS_O_WORKDIR"
+
+# --- Environment (project env is 'pila', NOT base) ---
+source /eos-rs/miniconda3/etc/profile.d/conda.sh
+conda activate pila
+export PYTHONPATH="${PYTHONPATH}:$PBS_O_WORKDIR"
+
+echo "[dvl2_combined_lam1e4] Host: $(hostname)  Env: $CONDA_DEFAULT_ENV  Workdir: $PBS_O_WORKDIR"
+echo "[dvl2_combined_lam1e4] Start: $(date)"
+
+# --- Named paths (sigmoid-ramp dV cube + its ground-truth trajectory) ---
+CONFIG="configs/synth/marapi_mogi_rising_combined_dvl2_lam1e4.json"
+SAVE_DIR="saved/dvl2_marapi_mogi_rising_combined/lam1e4"
+TRUTH_JSON="synthetic/cubes/marapi_mogi_rising_combined/marapi_mogi_rising_combined_truth.json"
+SERIES_CSV="$SAVE_DIR/uspace_series.csv"
+OUT_STEM="$SAVE_DIR/param_recovery_dvl2_combined_lam1e4"
+
+# --- Step 1/3: single-run training (dV-L1 penalty via dv_l1_weight; iterprior NOT used) ---
+echo "[dvl2_combined_lam1e4] Step 1/3: training..."
+python train_pila.py --config "$CONFIG"
+
+# --- Step 2/3: locate the freshly-trained checkpoint (newest model_best.pth) ---
+CKPT="$(find "$SAVE_DIR" -name model_best.pth -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
+if [ -z "$CKPT" ]; then
+  echo "[dvl2_combined_lam1e4] ERROR: no model_best.pth under $SAVE_DIR" >&2
+  exit 1
+fi
+echo "[dvl2_combined_lam1e4] Checkpoint: $CKPT"
+
+# --- Step 2b: dump the per-epoch u-space series ---
+echo "[dvl2_combined_lam1e4] Step 2/3: dumping per-epoch u-space series..."
+python dump_uspace_series.py --config "$CONFIG" --resume "$CKPT" --out "$SERIES_CSV"
+
+# --- Step 3/3: overlay recovered per-epoch parameters vs synthetic ground truth ---
+echo "[dvl2_combined_lam1e4] Step 3/3: plotting recovered vs truth..."
+python plot_iterprior_vs_truth.py \
+  --series "$SERIES_CSV" \
+  --truth "$TRUTH_JSON" \
+  --out "$OUT_STEM" \
+  --label "dV-L2 lambda=10000, sigmoid dV"
+
+echo "[dvl2_combined_lam1e4] Param-recovery figure: $PBS_O_WORKDIR/${OUT_STEM}.png"
+echo "[dvl2_combined_lam1e4] Finished: $(date)"

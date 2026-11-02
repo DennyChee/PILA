@@ -1,0 +1,69 @@
+#!/bin/bash
+# Usage:       qsub jobs/submit_mintpy_ta69_redundant_resume.pbs
+# Description: Resume the redundant-network MintPy run for Marapi S1 TA69 from invert_network.
+#              The first attempt (PBS 3976503) crashed in ifgram_inversion because the shared
+#              base env had NumPy 2.5.3, which MintPy 1.6.1's weighted inversion does not support.
+#              This job uses the group isce2_latest_MPv1.6.1 environment (NumPy 1.24.4).
+#              The partial outputs from the failed attempt are moved (not deleted) into
+#              failed_attempt_3976503/ before rerunning.
+# Date:        2026-10-06
+#PBS -N mintpy_ta69_res
+#PBS -P eos_btaisne
+#PBS -q qintel_wfly
+#PBS -l nodes=1:ppn=8
+#PBS -l walltime=12:00:00
+#PBS -l mem=32gb
+#PBS -j oe
+#PBS -o /eos-rs/INSAR_processing/denny/PILA/logs/mintpy_ta69_redundant_resume_pbs.log
+
+set -e
+
+# --- Named paths ---
+NEW_DIR="/eos-rs/INSAR_processing/denny/Marapi/S1_TA69/mintpy_redundant"
+CFG="$NEW_DIR/smallbaselineApp.cfg"
+FAILED_DIR="$NEW_DIR/failed_attempt_3976503"
+ENV_SCRIPT="/eos-rs/insarscripts/isce2-code/isce2_latest_MPv1.6.1_env.sh"
+# Explicit log too, in case PBS stage-out of the -o file fails again (it did for 3976503)
+RUN_LOG="/eos-rs/INSAR_processing/denny/PILA/logs/mintpy_ta69_redundant_resume_run.log"
+
+# --- Environment: group MintPy 1.6.1 env with NumPy < 2.3 ---
+# The env script calls `module purge` and references unset variables, so relax -e/-u around it
+set +e
+source "$ENV_SCRIPT"
+set -e
+export OMP_NUM_THREADS=8
+echo "[mintpy_ta69_res] Host: $(hostname)  Env: $CONDA_DEFAULT_ENV  Start: $(date)" | tee "$RUN_LOG"
+python -c "import mintpy, numpy; print('[mintpy_ta69_res] MintPy', mintpy.__version__, '| NumPy', numpy.__version__)" | tee -a "$RUN_LOG"
+
+# --- Safety: refuse to run if the stack or config is missing ---
+if [ ! -f "$NEW_DIR/inputs/ifgramStack.h5" ] || [ ! -f "$CFG" ]; then
+  echo "ERROR: $NEW_DIR/inputs/ifgramStack.h5 or $CFG missing" | tee -a "$RUN_LOG" >&2
+  exit 1
+fi
+
+echo "[1/3] Moving partial outputs of failed attempt into $FAILED_DIR (no deletion)..." | tee -a "$RUN_LOG"
+mkdir -p "$FAILED_DIR"
+for partial_file in timeseries.h5 temporalCoherence.h5 numInvIfgram.h5; do
+  if [ -e "$NEW_DIR/$partial_file" ]; then
+    mv -n "$NEW_DIR/$partial_file" "$FAILED_DIR/"
+  fi
+done
+
+echo "[2/3] smallbaselineApp from invert_network onward..." | tee -a "$RUN_LOG"
+cd "$NEW_DIR"
+smallbaselineApp.py "$CFG" --dir "$NEW_DIR" --start invert_network 2>&1 | tee -a "$RUN_LOG"
+# tee hides smallbaselineApp's exit code from set -e; check it explicitly
+if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+  echo "ERROR: smallbaselineApp failed (see $RUN_LOG)" >&2
+  exit 1
+fi
+
+echo "[3/3] Quick QC: temporal coherence should no longer be ~1 everywhere" | tee -a "$RUN_LOG"
+python -c "
+import h5py, numpy as np
+with h5py.File('temporalCoherence.h5', 'r') as f:
+    tcoh = f['temporalCoherence'][:]
+valid = np.isfinite(tcoh) & (tcoh > 0)
+print('  tempCoh median %.3f, frac >= 0.7: %.3f' % (np.median(tcoh[valid]), np.mean(tcoh[valid] >= 0.7)))
+" | tee -a "$RUN_LOG"
+echo "[mintpy_ta69_res] Finished: $(date). Output in $NEW_DIR" | tee -a "$RUN_LOG"
