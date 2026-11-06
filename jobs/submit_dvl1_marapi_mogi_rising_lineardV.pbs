@@ -1,0 +1,64 @@
+#!/bin/bash
+# Usage:       qsub jobs/submit_dvl1_marapi_mogi_rising_lineardV.pbs
+# Description: Part A sanity check for the dV-sparsity L1 penalty. IDENTICAL to
+#              submit_baseline_marapi_mogi_rising_lineardV.pbs except the config
+#              enables dv_l1_weight (L1 on |z_dV - z_center|, pulling physical dV
+#              toward 0 for quiescent epochs). Compare the recovered dV trajectory
+#              against the baseline run to confirm: quiescent early epochs -> dV~=0
+#              (depth no longer railing deep) while the rising-dV segment is still
+#              recovered. Sweep dv_l1_weight in the config (0.01..0.1) as needed.
+#              train -> dump per-epoch u-space series -> plot recovered vs truth.
+# Date:        2026-07-09
+#PBS -N dvl1_lineardV
+#PBS -P eos_btaisne
+#PBS -q qintel_wfly
+#PBS -l nodes=1:ppn=8
+#PBS -l walltime=12:00:00
+#PBS -l mem=16gb
+#PBS -j oe
+#PBS -o logs/dvl1_lineardV_pbs.log
+
+set -e
+cd "$PBS_O_WORKDIR"
+
+# --- Environment (project env is 'pila', NOT base) ---
+source /eos-rs/miniconda3/etc/profile.d/conda.sh
+conda activate pila
+export PYTHONPATH="${PYTHONPATH}:$PBS_O_WORKDIR"
+
+echo "[dvl1_lineardV] Host: $(hostname)  Env: $CONDA_DEFAULT_ENV  Workdir: $PBS_O_WORKDIR"
+echo "[dvl1_lineardV] Start: $(date)"
+
+# --- Named paths (same cube/truth as the baseline control) ---
+CONFIG="configs/synth/marapi_mogi_rising_lineardV_dvl1.json"
+SAVE_DIR="saved/dvl1_marapi_mogi_rising_lineardV/run"
+TRUTH_JSON="synthetic/cubes/marapi_mogi_rising_lineardV/marapi_mogi_rising_lineardV_truth.json"
+SERIES_CSV="$SAVE_DIR/uspace_series.csv"
+OUT_STEM="$SAVE_DIR/param_recovery_dvl1_lineardV"
+
+# --- Step 1/3: single-run training with the dV L1 sparsity penalty enabled ---
+echo "[dvl1_lineardV] Step 1/3: training (dV-L1 sparsity penalty, single run)..."
+python train_pila.py --config "$CONFIG"
+
+# --- Step 2/3: locate the freshly-trained checkpoint (newest model_best.pth) ---
+CKPT="$(find "$SAVE_DIR" -name model_best.pth -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
+if [ -z "$CKPT" ]; then
+  echo "[dvl1_lineardV] ERROR: no model_best.pth under $SAVE_DIR" >&2
+  exit 1
+fi
+echo "[dvl1_lineardV] Checkpoint: $CKPT"
+
+# --- Step 2b: dump the per-epoch u-space series ---
+echo "[dvl1_lineardV] Step 2/3: dumping per-epoch u-space series..."
+python dump_uspace_series.py --config "$CONFIG" --resume "$CKPT" --out "$SERIES_CSV"
+
+# --- Step 3/3: overlay recovered per-epoch parameters vs synthetic ground truth ---
+echo "[dvl1_lineardV] Step 3/3: plotting recovered vs truth..."
+python plot_iterprior_vs_truth.py \
+  --series "$SERIES_CSV" \
+  --truth "$TRUTH_JSON" \
+  --out "$OUT_STEM" \
+  --label "dV-L1 penalty, linear dV"
+
+echo "[dvl1_lineardV] Param-recovery figure: $PBS_O_WORKDIR/${OUT_STEM}.png"
+echo "[dvl1_lineardV] Finished: $(date)"

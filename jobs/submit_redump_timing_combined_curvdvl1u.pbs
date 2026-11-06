@@ -1,0 +1,72 @@
+#!/bin/bash
+# Usage:       qsub jobs/submit_redump_timing_combined_curvdvl1u.pbs
+# Description: Re-run ONLY the cheap post-training steps for all 12 combined_curvdvl1u
+#              runs: the per-epoch u-space dump (now instrumented, so it emits
+#              infer_usage.json) and the recovered-vs-truth plot. Training is NOT
+#              repeated -- each run's existing model_best.pth is reused.
+#              WHY: the 11 production jobs (3868788-3868798) ran the dump before the
+#              timing instrumentation landed, so uspace_series.csv exists but
+#              infer_usage.json does not. They also all exited non-zero on a wrapper
+#              bug in plot_recovered_vs_truth.py (sys.exit of a dict) AFTER writing
+#              their figures; that is fixed, so this also confirms a clean exit.
+#              Cost: ~5 s per cube (inference is ~0.2 s for all 76 epochs), so all 12
+#              run serially in one job rather than as 12 separate submissions.
+# Date:        2026-09-07
+#PBS -N redump_timing_curvdvl1u
+#PBS -P eos_btaisne
+#PBS -q qintel_wfly
+#PBS -l nodes=1:ppn=8
+#PBS -l walltime=00:30:00
+#PBS -l mem=16gb
+#PBS -j oe
+#PBS -o logs/redump_timing_curvdvl1u_pbs.log
+
+set -e
+cd "$PBS_O_WORKDIR"
+
+source /eos-rs/miniconda3/etc/profile.d/conda.sh
+conda activate pila
+export PYTHONPATH="${PYTHONPATH}:$PBS_O_WORKDIR"
+
+CELL="curv15000_dvl1u300"
+RUN_LOG="logs/redump_timing_curvdvl1u_${PBS_JOBID%%.*}.log"
+mkdir -p logs
+exec > >(tee "$RUN_LOG") 2>&1
+
+echo "[redump] Host: $(hostname)  Env: $CONDA_DEFAULT_ENV  Job: $PBS_JOBID"
+echo "[redump] Start: $(date)"
+
+n_ok=0
+n_fail=0
+for SAVE_DIR in saved/combined_curvdvl1u_*/"$CELL"; do
+  CUBE="$(basename "$(dirname "$SAVE_DIR")" | sed 's/^combined_curvdvl1u_//')"
+  CONFIG="configs/synth/${CUBE}_${CELL}.json"
+  TRUTH_JSON="synthetic/cubes/${CUBE}/${CUBE}_truth.json"
+  SERIES_CSV="$SAVE_DIR/uspace_series.csv"
+  OUT_STEM="$SAVE_DIR/param_recovery_combined_${CELL}_${CUBE}"
+
+  echo ""
+  echo "===== $CUBE ====="
+  CKPT="$(find "$SAVE_DIR" -name model_best.pth -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
+  if [ -z "$CKPT" ]; then
+    echo "  ERROR: no model_best.pth under $SAVE_DIR -- training never completed" >&2
+    n_fail=$((n_fail+1)); continue
+  fi
+
+  # `|| { ...; continue; }` so one bad cube does not abort the whole sweep under set -e.
+  if python dump_uspace_series.py --config "$CONFIG" --resume "$CKPT" --out "$SERIES_CSV"; then
+    python plot_recovered_vs_truth.py --series "$SERIES_CSV" --truth "$TRUTH_JSON" \
+      --out "$OUT_STEM" \
+      --label "combined_curvdvl1u curv=15000 lambda=300, $CUBE"
+    n_ok=$((n_ok+1))
+  else
+    echo "  ERROR: dump failed for $CUBE" >&2
+    n_fail=$((n_fail+1))
+  fi
+done
+
+echo ""
+echo "[redump] cubes OK=$n_ok  FAILED=$n_fail"
+echo "[redump] inference-timing sidecars now present:"
+ls -1 saved/combined_curvdvl1u_*/"$CELL"/infer_usage.json 2>/dev/null | wc -l
+echo "[redump] Finished: $(date)"

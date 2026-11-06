@@ -1,0 +1,63 @@
+#!/bin/bash
+# Usage:       qsub jobs/submit_baseline_marapi_mogi_staticloc_lineardV.pbs
+# Description: BASELINE (static N(0,I) prior) A/B control for the STATIC-LOCATION linear-dV
+#              Mogi test (xcen=ycen=3000 m, d=3000 m constant; dV ramps 1e6->8e7 @13dB).
+#              IDENTICAL to submit_temporalprior_marapi_mogi_staticloc_lineardV.pbs except
+#              temporal_prior.enabled=false, so the u_phy KL (same beta_max_z_phy=0.5)
+#              pulls toward the static standard-normal prior instead of the previous
+#              epoch's estimate. Isolates the effect of the temporal coupling.
+#              train -> dump per-epoch u-space series -> plot recovered vs truth.
+# Date:        2026-07-09
+#PBS -N base_staticloc
+#PBS -P eos_btaisne
+#PBS -q qintel_wfly
+#PBS -l nodes=1:ppn=8
+#PBS -l walltime=12:00:00
+#PBS -l mem=16gb
+#PBS -j oe
+#PBS -o logs/base_staticloc_pbs.log
+
+set -e
+cd "$PBS_O_WORKDIR"
+
+# --- Environment (project env is 'pila', NOT base) ---
+source /eos-rs/miniconda3/etc/profile.d/conda.sh
+conda activate pila
+export PYTHONPATH="${PYTHONPATH}:$PBS_O_WORKDIR"
+
+echo "[base_staticloc] Host: $(hostname)  Env: $CONDA_DEFAULT_ENV  Workdir: $PBS_O_WORKDIR"
+echo "[base_staticloc] Start: $(date)"
+
+# --- Named paths (same cube as the temporal-prior run) ---
+CONFIG="configs/synth/marapi_mogi_staticloc_lineardV_baseline.json"
+SAVE_DIR="saved/baseline_marapi_mogi_staticloc_lineardV/run"
+TRUTH_JSON="synthetic/cubes/marapi_mogi_staticloc_lineardV/marapi_mogi_staticloc_lineardV_truth.json"
+SERIES_CSV="$SAVE_DIR/uspace_series.csv"
+OUT_STEM="$SAVE_DIR/param_recovery_baseline_staticloc_lineardV"
+
+# --- Step 1/3: single-run training with the static N(0,I) prior ---
+echo "[base_staticloc] Step 1/3: training (baseline N(0,I), single run)..."
+python train_pila.py --config "$CONFIG"
+
+# --- Step 2/3: locate the freshly-trained checkpoint (newest model_best.pth) ---
+CKPT="$(find "$SAVE_DIR" -name model_best.pth -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
+if [ -z "$CKPT" ]; then
+  echo "[base_staticloc] ERROR: no model_best.pth under $SAVE_DIR" >&2
+  exit 1
+fi
+echo "[base_staticloc] Checkpoint: $CKPT"
+
+# --- Step 2b: dump the per-epoch u-space series ---
+echo "[base_staticloc] Step 2/3: dumping per-epoch u-space series..."
+python dump_uspace_series.py --config "$CONFIG" --resume "$CKPT" --out "$SERIES_CSV"
+
+# --- Step 3/3: overlay recovered per-epoch parameters vs synthetic ground truth ---
+echo "[base_staticloc] Step 3/3: plotting recovered vs truth..."
+python plot_iterprior_vs_truth.py \
+  --series "$SERIES_CSV" \
+  --truth "$TRUTH_JSON" \
+  --out "$OUT_STEM" \
+  --label "Baseline N(0,I), staticloc linear dV @13dB"
+
+echo "[base_staticloc] Param-recovery figure: $PBS_O_WORKDIR/${OUT_STEM}.png"
+echo "[base_staticloc] Finished: $(date)"

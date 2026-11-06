@@ -39,7 +39,7 @@ plt.rcParams.update({
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Overlay iterprior recovered params vs synthetic truth')
+    parser = argparse.ArgumentParser(description='Overlay recovered per-epoch source params vs synthetic truth')
     parser.add_argument('--series', required=True, type=str,
                         help='iterprior_series.csv from run_iterative_prior_refit.py')
     parser.add_argument('--truth', required=True, type=str,
@@ -87,7 +87,7 @@ def main():
     # the RECOVERED geometry tracks at epochs whose recovered |dV| < dv_eps_frac*peak|dV|,
     # so a null-epoch depth (an arbitrary floating value) is not read as signal. Truth and
     # the dV track itself are left untouched. `dv_gated` records the masked epochs for the
-    # light shading + caption note below.
+    # caption note below (the shaded overlay they used to drive was removed 2026-09-08).
     AMP_NAMES = {'dV', 'opening'}                 # source strength; never gated
     rec_plot = rec.copy()
     dv_gated = np.zeros(n_epoch, dtype=bool)
@@ -119,12 +119,11 @@ def main():
         ax.plot(ep, truth[:, j], 'k-', lw=2, label='truth')
         ax.plot(ep, rec_plot[:, j], 's--', color='C0', ms=3, alpha=0.8,
                 label=args.label)
-        # Shade epochs where the source is unresolved (dV~0) on the gated (geometry)
-        # subplots, so the break in the recovered track reads as "no estimate here".
-        if dv_gated.any() and pname not in AMP_NAMES:
-            for e in np.where(dv_gated)[0]:
-                ax.axvspan(e - 0.5, e + 0.5, color='0.85', alpha=0.5, lw=0,
-                           label='_nolegend_')
+        # NO grey shading of the unresolved (dV~0) epochs: DC asked for it removed
+        # (2026-09-08) because it overlays and obscures the tracks. The information is
+        # not lost -- those epochs are already NaN in rec_plot, so the recovered track
+        # BREAKS there, and the gating count is printed to the log above. The gating
+        # itself is unchanged; only its shaded overlay is gone.
         ax.set_xlabel('Epoch index')
         ax.set_ylabel(pname if not punit else f'{pname} ({punit})')
         ax.set_title(pname)
@@ -192,10 +191,12 @@ def main():
                 f'— {args.label}  [{noise_desc}]')
     fig.suptitle(suptitle, y=1.0)
 
-    # Note the gating so a reader understands the broken/shaded recovered geometry tracks.
+    # Note the gating so a reader understands the BREAKS in the recovered geometry tracks.
+    # Wording must not say "shaded": there is no shading any more, only the gaps.
     if dv_gated.any():
         fig.text(0.5, -0.03,
-                 f'Shaded epochs: recovered |dV| < {100*args.dv_eps_frac:.0f}% of peak '
+                 f'Gaps in the recovered geometry tracks: recovered |dV| < '
+                 f'{100*args.dv_eps_frac:.0f}% of peak '
                  f'— source unresolved, recovered location/depth undefined (masked).',
                  ha='center', va='top', fontsize=9, color='0.35')
 
@@ -204,10 +205,10 @@ def main():
     os.makedirs(os.path.dirname(out_stem) or '.', exist_ok=True)
     print("[3/3] Saving figures...")
     fig.tight_layout()
+    # PNG only, dpi=150 -- no matching PDF (standing project convention).
     fig.savefig(out_stem + '.png', dpi=150, bbox_inches='tight')
-    fig.savefig(out_stem + '.pdf', bbox_inches='tight')
     plt.close(fig)
-    print(f"Done. Saved: {out_stem}.png and {out_stem}.pdf")
+    print(f"Done. Saved: {out_stem}.png")
 
 
 if __name__ == '__main__':

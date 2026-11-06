@@ -1,0 +1,58 @@
+#!/bin/bash
+# Usage:       qsub jobs/submit_tscurv_marapi_mogi_rising_combined_lam2000.pbs
+# Description: Temporal smooth (curvature) (weight=2000.0) on the synthetic cube marapi_mogi_rising_combined.
+#              train -> dump per-epoch u-space series -> plot recovered vs truth.
+# Date:        2026-07-27
+#PBS -N tscurv_lam2000
+#PBS -P eos_btaisne
+#PBS -q qintel_wfly
+#PBS -l nodes=1:ppn=8
+#PBS -l walltime=12:00:00
+#PBS -l mem=16gb
+#PBS -j oe
+#PBS -o logs/tscurv_lam2000_marapi_mogi_rising_combined_pbs.log
+
+set -e
+cd "$PBS_O_WORKDIR"
+
+# --- Environment (project env is 'pila', NOT base) ---
+source /eos-rs/miniconda3/etc/profile.d/conda.sh
+conda activate pila
+export PYTHONPATH="${PYTHONPATH}:$PBS_O_WORKDIR"
+
+echo "[tscurv_lam2000] Host: $(hostname)  Env: $CONDA_DEFAULT_ENV  Workdir: $PBS_O_WORKDIR"
+echo "[tscurv_lam2000] Start: $(date)  u-space dV-L1 lambda=2000.0  cube=marapi_mogi_rising_combined"
+
+# --- Named paths (dV cube + its ground-truth trajectory) ---
+CONFIG="configs/synth/marapi_mogi_rising_combined_tscurv_lam2000.json"
+SAVE_DIR="saved/tscurv_marapi_mogi_rising_combined/lam2000"
+TRUTH_JSON="synthetic/cubes/marapi_mogi_rising_combined/marapi_mogi_rising_combined_truth.json"
+SERIES_CSV="$SAVE_DIR/uspace_series.csv"
+OUT_STEM="$SAVE_DIR/param_recovery_tscurv_lam2000"
+
+# --- Step 1/3: single-run training (u-space dV-L1 penalty via dv_l1_weight + dv_penalty_space) ---
+echo "[tscurv_lam2000] Step 1/3: training..."
+python train_pila.py --config "$CONFIG"
+
+# --- Step 2/3: locate the freshly-trained checkpoint (newest model_best.pth) ---
+CKPT="$(find "$SAVE_DIR" -name model_best.pth -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
+if [ -z "$CKPT" ]; then
+  echo "[tscurv_lam2000] ERROR: no model_best.pth under $SAVE_DIR" >&2
+  exit 1
+fi
+echo "[tscurv_lam2000] Checkpoint: $CKPT"
+
+# --- Step 2b: dump the per-epoch u-space series ---
+echo "[tscurv_lam2000] Step 2/3: dumping per-epoch u-space series..."
+python dump_uspace_series.py --config "$CONFIG" --resume "$CKPT" --out "$SERIES_CSV"
+
+# --- Step 3/3: overlay recovered per-epoch parameters vs synthetic ground truth ---
+echo "[tscurv_lam2000] Step 3/3: plotting recovered vs truth..."
+python plot_iterprior_vs_truth.py \
+  --series "$SERIES_CSV" \
+  --truth "$TRUTH_JSON" \
+  --out "$OUT_STEM" \
+  --label "Temporal smooth (curvature) w=2000.0, marapi_mogi_rising_combined"
+
+echo "[tscurv_lam2000] Param-recovery figure: $PBS_O_WORKDIR/${OUT_STEM}.png"
+echo "[tscurv_lam2000] Finished: $(date)"

@@ -1,0 +1,67 @@
+#!/bin/bash
+# Usage:       qsub jobs/submit_combined_curv15000_dvl1u300_marapi_mogi_move_locdepth.pbs
+# Description: combined_curvdvl1u PILA run on the synthetic cube marapi_mogi_move_locdepth:
+#              temporal curvature smoothing (weight=15000) + amplitude-L1 in
+#              pre-sigmoid u-space (lambda=300). One fixed cell for all 12
+#              cubes, for the untuned-vs-untuned head-to-head against vbICA.
+# Date:        2026-09-07
+#PBS -N combined_curv15000_dvl1u300_marapi_mogi_move_locdepth
+#PBS -P eos_btaisne
+#PBS -q qintel_wfly
+#PBS -l nodes=1:ppn=8
+#PBS -l walltime=12:00:00
+#PBS -l mem=16gb
+#PBS -j oe
+#PBS -o logs/combined_curv15000_dvl1u300_marapi_mogi_move_locdepth_pbs.log
+
+set -e
+cd "$PBS_O_WORKDIR"
+
+# --- Environment (project env is 'pila', NOT base) ---
+source /eos-rs/miniconda3/etc/profile.d/conda.sh
+conda activate pila
+export PYTHONPATH="${PYTHONPATH}:$PBS_O_WORKDIR"
+
+# --- Named paths ---
+CUBE="marapi_mogi_move_locdepth"
+CONFIG="configs/synth/marapi_mogi_move_locdepth_curv15000_dvl1u300.json"
+SAVE_DIR="saved/combined_curvdvl1u_marapi_mogi_move_locdepth/curv15000_dvl1u300"
+TRUTH_JSON="synthetic/cubes/marapi_mogi_move_locdepth/marapi_mogi_move_locdepth_truth.json"
+SERIES_CSV="$SAVE_DIR/uspace_series.csv"
+OUT_STEM="$SAVE_DIR/param_recovery_combined_curv15000_dvl1u300_marapi_mogi_move_locdepth"
+# Job id in the log name so reruns never clobber an earlier run's log.
+RUN_LOG="logs/combined_curv15000_dvl1u300_marapi_mogi_move_locdepth_${PBS_JOBID%%.*}.log"
+
+mkdir -p logs "$SAVE_DIR"
+# Truncating tee: this run owns this file.
+exec > >(tee "$RUN_LOG") 2>&1
+
+echo "[combined_curv15000_dvl1u300_marapi_mogi_move_locdepth] Host: $(hostname)  Env: $CONDA_DEFAULT_ENV  Job: $PBS_JOBID"
+echo "[combined_curv15000_dvl1u300_marapi_mogi_move_locdepth] Start: $(date)"
+echo "[combined_curv15000_dvl1u300_marapi_mogi_move_locdepth] cube=$CUBE  curvature=15000  amplitude-L1(u) lambda=300"
+
+# --- Step 1/3: training (curvature + u-space amplitude-L1 both active) ---
+echo "[combined_curv15000_dvl1u300_marapi_mogi_move_locdepth] Step 1/3: training..."
+python train_pila.py --config "$CONFIG"
+
+# --- Step 2/3: locate the freshly-trained checkpoint, dump per-epoch u-space series ---
+CKPT="$(find "$SAVE_DIR" -name model_best.pth -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
+if [ -z "$CKPT" ]; then
+  echo "[combined_curv15000_dvl1u300_marapi_mogi_move_locdepth] ERROR: no model_best.pth under $SAVE_DIR" >&2
+  exit 1
+fi
+echo "[combined_curv15000_dvl1u300_marapi_mogi_move_locdepth] Checkpoint: $CKPT"
+echo "[combined_curv15000_dvl1u300_marapi_mogi_move_locdepth] Step 2/3: dumping per-epoch u-space series..."
+python dump_uspace_series.py --config "$CONFIG" --resume "$CKPT" --out "$SERIES_CSV"
+
+# --- Step 3/3: overlay recovered per-epoch parameters vs synthetic ground truth ---
+echo "[combined_curv15000_dvl1u300_marapi_mogi_move_locdepth] Step 3/3: plotting recovered vs truth..."
+python plot_recovered_vs_truth.py \
+  --series "$SERIES_CSV" \
+  --truth "$TRUTH_JSON" \
+  --out "$OUT_STEM" \
+  --label "combined_curvdvl1u curv=15000 lambda=300, $CUBE"
+
+echo "[combined_curv15000_dvl1u300_marapi_mogi_move_locdepth] Series: $PBS_O_WORKDIR/$SERIES_CSV"
+echo "[combined_curv15000_dvl1u300_marapi_mogi_move_locdepth] Figure: $PBS_O_WORKDIR/${OUT_STEM}.png"
+echo "[combined_curv15000_dvl1u300_marapi_mogi_move_locdepth] Finished: $(date)"

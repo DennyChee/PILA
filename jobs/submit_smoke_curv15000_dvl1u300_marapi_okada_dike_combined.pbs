@@ -1,0 +1,82 @@
+#!/bin/bash
+# Usage:       qsub jobs/submit_smoke_curv15000_dvl1u300_marapi_okada_dike_combined.pbs
+# Description: 1-EPOCH SMOKE TEST for the combined_curvdvl1u campaign on marapi_okada_dike_combined.
+#              This cube is one of the two whose physics decoder AND train data
+#              loader change relative to the validated Mogi template (Okada/Sun69
+#              gain the InSARSeqh5DataLoader that the curvature term needs), so it
+#              is smoke-tested before the 12 h production job is released.
+#              Checks: the model builds, the Seq loader yields sequences, the
+#              amplitude penalty resolves to a real latent dim, one epoch trains,
+#              and the per-epoch dump produces a series with the right columns.
+#              NOT a result -- 1 epoch recovers nothing.
+# Date:        2026-09-07
+#PBS -N smoke_marapi_okada_dike_combined
+#PBS -P eos_btaisne
+#PBS -q qintel_wfly
+#PBS -l nodes=1:ppn=8
+#PBS -l walltime=01:00:00
+#PBS -l mem=16gb
+#PBS -j oe
+#PBS -o logs/smoke_marapi_okada_dike_combined_pbs.log
+
+set -e
+cd "$PBS_O_WORKDIR"
+
+source /eos-rs/miniconda3/etc/profile.d/conda.sh
+conda activate pila
+export PYTHONPATH="${PYTHONPATH}:$PBS_O_WORKDIR"
+
+CUBE="marapi_okada_dike_combined"
+BASE_CONFIG="configs/synth/${CUBE}_curv15000_dvl1u300.json"
+SMOKE_CONFIG="configs/synth/${CUBE}_curv15000_dvl1u300_SMOKE.json"
+SAVE_DIR="saved/_smoke_combined_curvdvl1u_${CUBE}"
+SERIES_CSV="$SAVE_DIR/uspace_series.csv"
+RUN_LOG="logs/smoke_${CUBE}_${PBS_JOBID%%.*}.log"
+
+mkdir -p logs "$SAVE_DIR"
+exec > >(tee "$RUN_LOG") 2>&1
+
+echo "[smoke] Host: $(hostname)  Env: $CONDA_DEFAULT_ENV  Job: $PBS_JOBID"
+echo "[smoke] cube=$CUBE  Start: $(date)"
+
+# --- Step 1/3: clone the production config with epochs=1 -------------------
+# save_dir is prefixed with '_' so score_pila_variants.py and stage_figures.py
+# both skip this run as archived and it can never reach the head-to-head.
+echo "[smoke] Step 1/3: writing 1-epoch config..."
+python - "$BASE_CONFIG" "$SMOKE_CONFIG" "$SAVE_DIR" <<'PYEOF'
+import json, sys
+src, dst, save_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+cfg = json.load(open(src))
+cfg['name'] = cfg['name'] + '_SMOKE'
+cfg['trainer']['epochs'] = 1
+cfg['trainer']['save_dir'] = save_dir
+if 'lr_scheduler' in cfg and 'T_max' in cfg['lr_scheduler'].get('args', {}):
+    cfg['lr_scheduler']['args']['T_max'] = 1
+json.dump(cfg, open(dst, 'w'), indent=2)
+print(f"  physics={cfg['arch']['args']['physics']}  "
+      f"dim_z_phy={cfg['arch']['phys_vae']['dim_z_phy']}  "
+      f"train_loader={cfg['data_loader']['type']}  "
+      f"seq_len={cfg['data_loader']['args'].get('seq_len')}")
+p = cfg['trainer']['phys_vae']
+print(f"  smoothness={p['temporal_smoothness_mode']}@{p['temporal_smoothness_weight']}  "
+      f"include_dv={p['temporal_smoothness_include_dv']}  "
+      f"dv_l1={p['dv_l1_weight']} space={p['dv_penalty_space']}")
+PYEOF
+
+# --- Step 2/3: one epoch of training --------------------------------------
+# WATCH THE LOG for the line "[temporal_smoothness] ON: ... +opening" (Okada) or
+# "+dV" (Sun69). If it says neither, the amplitude dim did not resolve and the
+# pull-to-zero penalty is a silent no-op -- do NOT release the production batch.
+echo "[smoke] Step 2/3: training 1 epoch..."
+python train_pila.py --config "$SMOKE_CONFIG"
+
+# --- Step 3/3: per-epoch dump ---------------------------------------------
+echo "[smoke] Step 3/3: dumping per-epoch series..."
+CKPT="$(find "$SAVE_DIR" -name 'model_best.pth' -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"
+if [ -z "$CKPT" ]; then echo "[smoke] ERROR: no model_best.pth under $SAVE_DIR" >&2; exit 1; fi
+python dump_uspace_series.py --config "$SMOKE_CONFIG" --resume "$CKPT" --out "$SERIES_CSV"
+
+echo "[smoke] Series columns / row count:"
+head -1 "$SERIES_CSV"
+echo "  rows (expect 77 = header + 76 epochs): $(wc -l < "$SERIES_CSV")"
+echo "[smoke] Finished: $(date)"
