@@ -123,7 +123,11 @@ def main(config, args: argparse.Namespace):
 
     # Inferred physics-parameter names depend on the physics type.
     physics = config.config['arch']['args'].get('physics', 'Okada_LOS')
-    if not no_phy:
+    if not no_phy and physics == 'MultiMogi_LOS':
+        # K-source Mogi: xcen_1, ycen_1, d_1, dV_1, xcen_2, ... (model_phys_smpl order)
+        from model.model_phys_smpl import multimogi_param_names
+        ATTRS = multimogi_param_names(int(config.config['arch']['args'].get('n_sources', 1)))
+    elif not no_phy:
         ATTRS = PHYSICS_ATTRS[physics]
     else:
         ATTRS = [str(i + 1) for i in range(dim_z_aux)]

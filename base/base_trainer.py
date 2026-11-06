@@ -93,7 +93,79 @@ class BaseTrainer:
 
     def train(self):
         """
-        Full training logic
+        Full training logic.
+
+        model_best.pth policy (trainer.best_checkpoint, default "lowest_monitor", 2026-10-22):
+          lowest_monitor  model_best.pth is written the moment the monitored metric (e.g. val_rec_loss) reaches a new
+                          best, so it always holds the best state seen -- also when a warm-restart LR jump later throws
+                          the model out of it. The final model stays in checkpoint-epoch<N>.pth. With monitor "off" (or
+                          the metric missing) model_best.pth falls back to the final model. model_best_info.json records
+                          which epoch it is.
+          final           legacy behaviour (all runs before 2026-10-22): model_best.pth = the final epoch.
+        """
+        policy = self.config['trainer'].get('best_checkpoint', 'lowest_monitor')
+        if policy == 'final':
+            return self._train_legacy_final_best()
+        if policy != 'lowest_monitor':
+            raise ValueError(f"trainer.best_checkpoint must be 'lowest_monitor' or 'final', got {policy!r}")
+        not_improved_count = 0
+        last_saved_epoch = None
+        best_epoch = None
+        for epoch in range(self.start_epoch, self.epochs + 1):
+            result = self._train_epoch(epoch)
+            log = {'epoch': epoch}
+            log.update(result)
+            for key, value in log.items():
+                self.logger.info('    {:15s}: {}'.format(str(key), value))
+
+            # --- Save model_best.pth immediately whenever the monitored metric improves ---
+            if self.mnt_mode != 'off':
+                try:
+                    improved = (self.mnt_mode == 'min' and log[self.mnt_metric] <= self.mnt_best) or \
+                               (self.mnt_mode == 'max' and log[self.mnt_metric] >= self.mnt_best)
+                except KeyError:
+                    self.logger.warning("Warning: Metric '{}' is not found. model_best.pth will be the final "
+                                        "model.".format(self.mnt_metric))
+                    self.mnt_mode = 'off'
+                    improved = False
+                if improved:
+                    self.mnt_best = log[self.mnt_metric]
+                    not_improved_count = 0
+                    best_epoch = epoch
+                    self._save_checkpoint(epoch, save_best=True, epoch_file=False)
+                    self._write_best_info(epoch, 'lowest_monitor')
+                else:
+                    not_improved_count += 1
+                if not_improved_count > self.early_stop:
+                    self.logger.info("Validation performance didn\'t improve for {} epochs. Training stops "
+                                     "(model_best.pth = epoch {}).".format(self.early_stop, best_epoch))
+                    break
+
+            if epoch % self.save_period == 0:
+                self._save_checkpoint(epoch, save_best=False)
+                last_saved_epoch = epoch
+
+        # --- Final model always kept as checkpoint-epoch<N>.pth ---
+        if last_saved_epoch != epoch:
+            self._save_checkpoint(epoch, save_best=False)
+        if best_epoch is None:                 # no monitor / metric missing: best = final (as before)
+            self._save_checkpoint(epoch, save_best=True, epoch_file=False)
+            self._write_best_info(epoch, 'final (no monitored metric)')
+            best_epoch = epoch
+        self.logger.info("Training completed. model_best.pth = epoch {} ({} {}); final model = "
+                         "checkpoint-epoch{}.pth".format(best_epoch, self.monitor, self.mnt_best, epoch))
+
+    def _write_best_info(self, epoch, how):
+        """Record which epoch model_best.pth holds (provenance for every downstream reader)."""
+        info = {'epoch': int(epoch), 'policy': how, 'monitor': self.monitor,
+                'monitor_value': float(self.mnt_best) if self.mnt_mode != 'off' else None}
+        with open(os.path.join(PARENT_DIR, str(self.checkpoint_dir / 'model_best_info.json')), 'w') as handle:
+            json.dump(info, handle, indent=2)
+
+    def _train_legacy_final_best(self):
+        """
+        Legacy training loop (trainer.best_checkpoint = "final"): model_best.pth = final epoch, unchanged from before
+        2026-10-22, for reproducing earlier runs exactly.
         """
         not_improved_count = 0
         last_saved_epoch = None
@@ -150,14 +222,15 @@ class BaseTrainer:
         # Always save the last model as the best model at the end of training
         self.logger.info("Training completed. Saving final model as model_best.pth ...")
         self._save_checkpoint(epoch, save_best=True)
+        self._write_best_info(epoch, 'final (legacy)')
 
-    def _save_checkpoint(self, epoch, save_best=False):
+    def _save_checkpoint(self, epoch, save_best=False, epoch_file=True):
         """
         Saving checkpoints
 
         :param epoch: current epoch number
-        :param log: logging information of the epoch
-        :param save_best: if True, rename the saved checkpoint to 'model_best.pth'
+        :param save_best: if True, also write the state to 'model_best.pth'
+        :param epoch_file: if False, skip checkpoint-epoch<N>.pth (used for mid-run best saves, to save disk)
         """
         arch = type(self.model).__name__
         state = {
@@ -168,13 +241,14 @@ class BaseTrainer:
             'monitor_best': self.mnt_best,
             'config': self.config
         }
-        filename = str(self.checkpoint_dir / 'checkpoint-epoch{}.pth'.format(epoch))
-        torch.save(state, os.path.join(PARENT_DIR, filename))
-        self.logger.info("Saving checkpoint: {} ...".format(filename))
+        if epoch_file:
+            filename = str(self.checkpoint_dir / 'checkpoint-epoch{}.pth'.format(epoch))
+            torch.save(state, os.path.join(PARENT_DIR, filename))
+            self.logger.info("Saving checkpoint: {} ...".format(filename))
         if save_best:
             best_path = str(self.checkpoint_dir / 'model_best.pth')
             torch.save(state, os.path.join(PARENT_DIR, best_path))
-            self.logger.info("Saving current best: model_best.pth ...")
+            self.logger.info("Saving current best: model_best.pth (epoch {}) ...".format(epoch))
 
     def _load_and_save_best(self, epoch):
         """

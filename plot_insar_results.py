@@ -5,7 +5,8 @@
 #              Okada_LOS, MLP) checkpoint. Runs the trained physics-VAE on the
 #              multilooked MintPy LOS field, de-standardizes to mm, and plots
 #              reconstructed-vs-actual LOS as (a) a 3-panel map over a hillshade
-#              background derived from geo_geometryRadar.h5 and (b) a 1:1 scatter.
+#              background derived from geo_geometryRadar.h5 and (b) a 1:1 scatter
+#              (maps only for local-frame .npz scenes, e.g. COMSOL).
 # Date:        2026-06-13
 #
 # Scientific conventions (READ — these affect interpretation):
@@ -498,8 +499,58 @@ def _paired_bars(ax, true_value, pila_value, title, ylabel, value_fmt):
     ax.grid(axis='x', visible=False)
 
 
+def los_geometry_from_npz(scene_npz, track):
+    """
+    Flight heading and incidence of a local-frame npz scene (scalar geometry, as in the
+    COMSOL catalogue). Inputs: scene_npz str, track 'asc'/'desc'.
+    Output: (heading_deg clockwise from north, incidence_deg), or None if keys are missing.
+    Spatially varying geometry is summarised by its scene mean (only used for the glyph).
+    """
+    with np.load(scene_npz) as scene:
+        head_key = f'heading_{track}_deg'
+        if head_key not in scene.files or 'incidence_deg' not in scene.files:
+            return None
+        return float(np.mean(scene[head_key])), float(np.mean(scene['incidence_deg']))
+
+
+def draw_los_glyph(ax, heading_deg, incidence_deg, track):
+    """
+    Satellite-geometry glyph in the upper-right corner of a map (axes-fraction coordinates).
+
+    Thin arrow = flight direction (heading, clockwise from north). Thick arrow = horizontal
+    LOOK direction, satellite -> ground, right-looking SAR: (E, N) = (cos h, -sin h), i.e.
+    the heading rotated 90 deg clockwise. It is the exact opposite of the horizontal part of
+    the ground->satellite unit vector used for LOS (+ = toward satellite), so ground motion
+    ALONG the thick arrow reads NEGATIVE (away from the satellite).
+    Inputs: ax (equal-aspect map axes), heading_deg, incidence_deg (deg), track 'asc'/'desc'.
+    """
+    heading_rad = np.deg2rad(heading_deg)
+    flight_en = np.array([np.sin(heading_rad), np.cos(heading_rad)])
+    look_en = np.array([np.cos(heading_rad), -np.sin(heading_rad)])
+    centre = np.array([0.80, 0.80])        # axes fraction; maps are square (equal aspect)
+    flight_len, look_len = 0.11, 0.14
+    # Background disc so the glyph stays legible over strong red/blue displacement.
+    ax.add_patch(plt.Circle(centre, 0.165, transform=ax.transAxes, facecolor='white',
+                            edgecolor=_INK_MUTED, alpha=0.85, lw=0.8, zorder=5))
+    ax.annotate('', xy=centre + flight_len * flight_en, xytext=centre - flight_len * flight_en,
+                xycoords='axes fraction',
+                arrowprops=dict(arrowstyle='-|>', color=_INK_PRIMARY, lw=1.2, mutation_scale=12),
+                zorder=6)
+    ax.annotate('', xy=centre + look_len * look_en, xytext=centre, xycoords='axes fraction',
+                arrowprops=dict(arrowstyle='-|>', color=_INK_PRIMARY, lw=3.0, mutation_scale=18),
+                zorder=6)
+    # Label beside the look arrow (offset against the flight direction) so it never sits on
+    # the arrowhead, whichever way the track looks.
+    ax.text(*(centre + 0.55 * look_len * look_en - 0.06 * flight_en), 'LOS',
+            transform=ax.transAxes, ha='center', va='center', fontsize=11, fontweight='bold',
+            color=_INK_PRIMARY, zorder=6)
+    ax.text(centre[0], centre[1] - 0.205, f"{track.upper()}  inc {incidence_deg:.0f}°",
+            transform=ax.transAxes, ha='center', va='top', fontsize=9, color=_INK_PRIMARY,
+            zorder=6, bbox=dict(facecolor='white', edgecolor='none', alpha=0.85, pad=1.5))
+
+
 def plot_presentation_maps(actual_mm, phys_mm, disp_extent, section, dV_pila_m3, out_base,
-                           prior_footnote=None):
+                           prior_footnote=None, track=None, los_geometry=None):
     """
     Slide-ready (16:9) summary of one COMSOL chamber inversion: PILA Mogi vs the known truth.
 
@@ -513,7 +564,9 @@ def plot_presentation_maps(actual_mm, phys_mm, disp_extent, section, dV_pila_m3,
 
     Inputs : actual_mm, phys_mm [ny, nx] LOS grids (mm); disp_extent (km, local frame);
              section dict(outline=load_chamber_section(...), xcen_m, ycen_m, depth_m) in m;
-             dV_pila_m3 recovered volume change (m^3) or None; prior_footnote optional str.
+             dV_pila_m3 recovered volume change (m^3) or None; prior_footnote optional str;
+             track 'asc'/'desc' (labels); los_geometry (heading_deg, incidence_deg) or None
+             -> LOS/flight glyph drawn on every map.
     Truth  : axis (0, 0); depth = centroid (flat z = 0 datum); dV = COMSOL cavity dV.
     Output : <out_base>_maps.png (PNG only, user preference).
     """
@@ -569,6 +622,9 @@ def plot_presentation_maps(actual_mm, phys_mm, disp_extent, section, dV_pila_m3,
             ax.set_xlim(image_extent[0], image_extent[1])
             ax.set_ylim(image_extent[2], image_extent[3])
         map_axes[0].legend(loc='lower left', framealpha=0.9)
+        if los_geometry is not None:
+            for ax in map_axes:
+                draw_los_glyph(ax, los_geometry[0], los_geometry[1], track or '')
 
         # --- Bottom row (a): E-W cross-section, true chamber vs PILA point source ---
         ax_section = fig.add_subplot(grid[1, 0])
@@ -632,12 +688,13 @@ def plot_presentation_maps(actual_mm, phys_mm, disp_extent, section, dV_pila_m3,
         # Title names the case; the footnote carries conventions + the prior-railing check.
         surface_label = {'flat': 'flat surface', 'cone': '1 km cone'}.get(outline['surface'],
                                                                          'surface n/a')
+        track_label = {'asc': 'ascending', 'desc': 'descending'}.get(track, 'LOS')
         fig.suptitle(f"Chamber cid {outline['cid']} (A = {outline['elongation_A']}, "
-                     f"{surface_label}): PILA Mogi vs COMSOL truth",
+                     f"{surface_label}, {track_label}): PILA Mogi vs COMSOL truth",
                      fontsize=20, color=_INK_PRIMARY)
         footnote = ("Truth: chamber axis at (0, 0); depth = volume centroid from the flat z = 0 "
                     f"datum (chamber top {-outline['z_top_m'] / 1000.0:.1f} km); dV = COMSOL cavity "
-                    "volume change. Descending LOS.")
+                    f"volume change. {track_label.capitalize()} LOS, + = toward satellite.")
         if prior_footnote:
             footnote += f"  Prior check: {prior_footnote}."
         fig.text(0.5, -0.01, footnote, ha='center', va='top', fontsize=11, color=_INK_MUTED)
@@ -833,12 +890,16 @@ def main():
         # Known COMSOL chamber: slide-ready truth-vs-PILA layout replaces the 4-map figure.
         plot_presentation_maps(actual_grid, phys_grid, disp_extent, section,
                                _param_scalar(params['dV']) if 'dV' in params else None,
-                               out_base, prior_footnote=prior_footnote)
+                               out_base, prior_footnote=prior_footnote, track=geometry_h5,
+                               los_geometry=los_geometry_from_npz(insar_args['timeseries'],
+                                                                  geometry_h5))
     else:
         plot_maps(actual_grid, phys_grid, full_grid, disp_extent, hs, hs_extent, out_base,
                   param_text=param_text, fit_text=fit_text_fig,
                   suptitle=f"{config['name']} ({date_str}): physics vs. actual LOS")
-    plot_scatter(actual_mm, phys_mm, out_base)   # scatter on the pure-physics source fit
+    if not is_npz_scene:
+        # Local-frame npz (COMSOL) scenes: maps only, by request (R2/RMSE are on the map figure).
+        plot_scatter(actual_mm, phys_mm, out_base)   # scatter on the pure-physics source fit
 
     # Persist the inferred parameters next to the figures (so they're stored, not just shown).
     if param_text is not None:

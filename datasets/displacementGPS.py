@@ -247,6 +247,12 @@ class DisplacementInSARh5(data.Dataset):
         data_dict = {}
         data_dict['displacement'] = torch.tensor(self.series[index]).to(torch.float32)
         data_dict['date'] = self.dates[index]
+        # Chronological epoch ordinal of this sample. self.series/self.dates are in
+        # MintPy acquisition order (epoch 0 = reference date), and this is the Stage-A
+        # per-epoch path (one sample == one epoch), so the dataset index IS the epoch
+        # ordinal regardless of DataLoader shuffling. Consumed by the trainer's
+        # per-sample temporal KL prior (temporal_prior) to look up epoch (t-1)'s guess.
+        data_dict['epoch_idx'] = int(index)
         # 4-dim time features (annual + semi-annual); model uses first time_feat_dim.
         time_features = time_feats(self.dates[index], time_feat_dim=4)
         data_dict['time_feats'] = torch.tensor(time_features).to(torch.float32)

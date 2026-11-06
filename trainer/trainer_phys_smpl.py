@@ -12,6 +12,9 @@ NEW METRICS ADDED:
 # Adapted from the training script of Phys-VAE
 import numpy as np
 import torch
+import csv
+import time
+from utils.timing import PhaseTimer
 import os
 from torchvision.utils import make_grid
 from base import BaseTrainer, PARENT_DIR
@@ -70,7 +73,148 @@ class PhysVAETrainerSMPL(BaseTrainer):
         # NEW: Edge penalty for z_phy to avoid extreme values (0, 1)
         self.edge_penalty_weight = config['trainer']['phys_vae'].get('edge_penalty_weight', 0.0)
         self.edge_penalty_power = config['trainer']['phys_vae'].get('edge_penalty_power', 1.0)
+
+        # NEW: dV sparsity penalty. L1 on the dV latent toward its centre (z=0.5),
+        # which maps EXACTLY to physical dV=0 in both configs/mogi_paras.json and
+        # configs/mogi_paras_symdV.json. This lets the encoder return dV=0 for
+        # quiescent (no-deformation) epochs instead of the degenerate
+        # "large dV at a very deep depth" solution. Default 0.0 -> feature off,
+        # so existing configs and runs are unchanged.
+        self.dv_l1_weight = config['trainer']['phys_vae'].get('dv_l1_weight', 0.0)
+        # NEW: dV L2 (quadratic) sparsity penalty toward the same physical-dV=0 centre.
+        # Complements/replaces the L1 form. Because the dV<->z map is affine, a physical
+        # spike (e.g. dV=2e8 -> z=1.0, |z-z0|=0.5) sits FURTHER from centre than the
+        # genuine rise (dV=8e7 -> z=0.7, |z-z0|=0.2). L1's gradient is constant in
+        # |z-z0| so it cannot crush a saturated spike without also dragging the rise;
+        # L2's gradient grows with |z-z0|, so it penalises the z=1.0 spike ~6x harder
+        # than the z=0.7 rise (0.5^2 vs 0.2^2) and pushes saturated outliers back much
+        # more strongly. Default 0.0 -> feature off; L1 and L2 can be combined.
+        self.dv_l2_weight = config['trainer']['phys_vae'].get('dv_l2_weight', 0.0)
+        # NEW: dv_penalty_space controls the SPACE the dV penalty acts in.
+        #   'z' (default, legacy) -> penalise |z_dV - z0| in post-sigmoid (0,1) space.
+        #       Problem: the optimiser only moves the pre-sigmoid u (z = sigmoid(u)), so the
+        #       gradient carries a z(1-z) factor that -> 0 at the rail (z->0/1) -- exactly the
+        #       dV-railing failure mode we want to fix. A larger weight cannot pull a railed
+        #       dV back because it just multiplies a ~0 gradient.
+        #   'u' -> penalise |u_dV - u0| in pre-sigmoid space, u0 = logit(z0). u is unbounded
+        #       and linear, so the pull is a constant, non-vanishing force even at the rail.
+        # Default 'z' keeps every existing config/run byte-identical.
+        self.dv_penalty_space = config['trainer']['phys_vae'].get('dv_penalty_space', 'z')
+        if self.dv_penalty_space not in ('z', 'u'):
+            raise ValueError(
+                f"dv_penalty_space must be 'z' or 'u', got {self.dv_penalty_space!r}")
+        # Locate the dV dimension in the physics decoder's parameter ordering, and
+        # the z-value that maps to physical dV=0 for THIS config.
+        #   physical_dV(z) = (z*(max-min)+min) * scale + shift   (see rescale())
+        # Solving physical_dV(z0)=0 gives z0 = ((-shift/scale) - min)/(max-min).
+        # We penalise |z_dV - z0| so the term pulls toward physical dV=0 regardless
+        # of the config's min/max/scale/shift (z0=0.5 for the symmetric/default Mogi
+        # configs, but differs when custom min/max are used with default scale/shift).
+        # The amplitude parameter is named 'dV' for Mogi and Sun69 but 'opening' for
+        # Okada, whose paras file has no 'dV' key at all. Resolving only 'dV' made BOTH
+        # this penalty AND temporal_smoothness_include_dv silent no-ops on every Okada
+        # config -- the loss term was configured, logged and ignored. We therefore look
+        # for 'dV' first and fall back to 'opening', keeping the attribute names (_dv_*)
+        # for backward compatibility. Mogi/Sun69 configs resolve exactly as before, so
+        # existing runs are bit-identical.
+        # Stays None only for no_phy mode or a source with neither parameter.
+        self._dv_dim = None
+        self._dv_name = None
+        self._dv_z_center = 0.5
+        # Pre-sigmoid target for the u-space penalty: u0 = logit(z0). Default logit(0.5)=0.
+        self._dv_u_center = 0.0
+        if (not self.no_phy) and hasattr(self.model, 'physics_model') \
+                and hasattr(self.model.physics_model, 'z_phy_ranges'):
+            z_phy_param_names = list(self.model.physics_model.z_phy_ranges.keys())
+            amp_name = next((nm for nm in ('dV', 'opening') if nm in z_phy_param_names), None)
+            if amp_name is not None:
+                self._dv_name = amp_name
+                self._dv_dim = z_phy_param_names.index(amp_name)
+                dv_range = self.model.physics_model.z_phy_ranges[amp_name]
+                dv_min = float(dv_range['min'])
+                dv_max = float(dv_range['max'])
+                if amp_name == 'dV':
+                    # Mogi/Sun69: physical dV = (rescaled dV)*scale + shift, so the
+                    # scale/shift defaults below reproduce the legacy hardcoded map
+                    # (see Physics_Mogi.rescale / Physics_Sun69.rescale).
+                    dv_scale = float(dv_range.get('scale', 1e5))
+                    dv_shift = float(dv_range.get('shift', -1e7))
+                else:
+                    # Okada 'opening' is a PLAIN linear rescale in
+                    # Physics_Okada.rescale -- no scale/shift transform is applied to
+                    # it -- so the identity map (scale=1, shift=0) is the correct one
+                    # here. Using the dV defaults would solve for the wrong z0.
+                    dv_scale = float(dv_range.get('scale', 1.0))
+                    dv_shift = float(dv_range.get('shift', 0.0))
+                # z that yields physical amplitude = 0
+                self._dv_z_center = ((-dv_shift / dv_scale) - dv_min) / (dv_max - dv_min)
+                # Pre-sigmoid target u0 = logit(z0) for the u-space penalty. Clamp z0 off the
+                # 0/1 asymptotes first, since logit(0/1)=+-inf (np is already imported; avoids
+                # a new `import math`). For the symmetric symdV configs z0=0.5 -> u0=0.
+                _zc = min(max(self._dv_z_center, 1e-6), 1.0 - 1e-6)
+                self._dv_u_center = float(np.log(_zc / (1.0 - _zc)))
+                # dV=0 must be reachable within the (0,1) latent range, else the L1/L2
+                # penalty would pull toward a spurious nonzero dV. Fail loudly.
+                if (self.dv_l1_weight > 0.0 or self.dv_l2_weight > 0.0) \
+                        and not (0.0 <= self._dv_z_center <= 1.0):
+                    raise ValueError(
+                        f"dv_l1_weight/dv_l2_weight>0 but physical {amp_name}=0 is not reachable "
+                        f"for this config: z0={self._dv_z_center:.4f} lies outside [0,1] "
+                        f"({amp_name} min={dv_min}, max={dv_max}, scale={dv_scale}, "
+                        f"shift={dv_shift}). Adjust the paras so {amp_name}=0 is in range.")
         
+        # Multi-source decoders (physics 'MultiMogi_LOS'): z_phy holds K blocks of the paras-file
+        # parameters, so the amplitude dim repeats every n_per_source dims. _dv_dims lists every
+        # source's amplitude index; for single-source physics it is [_dv_dim] (or []), so the
+        # dV penalties below give bit-identical values to the old single-index code.
+        self._n_sources = int(getattr(getattr(self.model, 'physics_model', None), 'n_sources', 1))
+        if self._dv_dim is None:
+            self._dv_dims = []
+        else:
+            n_per_source = len(self.model.physics_model.z_phy_ranges)
+            self._dv_dims = [k * n_per_source + self._dv_dim for k in range(self._n_sources)]
+        if self._n_sources > 1:
+            unsupported = [name for name, on in [
+                ('arch.phys_vae.temporal_prior', config['arch']['phys_vae'].get('temporal_prior', {}).get('enabled', False)),
+                ('arch.phys_vae.informed_prior', config['arch']['phys_vae'].get('informed_prior', {}).get('enabled', False)),
+                ('arch.phys_vae.iterative_refinement', config['arch']['phys_vae'].get('iterative_refinement', {}).get('enabled', False)),
+            ] if on]
+            if unsupported:
+                raise ValueError(f"n_sources={self._n_sources} is not supported together with {unsupported} "
+                                 "(these assume a single 4-parameter source)")
+
+        # Optional per-acquisition NUISANCE offset + planar ramp (standard in geodetic inversion).
+        # MintPy-style LOS maps carry an arbitrary constant (reference pixel) and long-wavelength
+        # tilts (orbit / large-scale APS) that a point source cannot model; with plain MSE the
+        # source is then dragged into a deep corner position to mimic them. With
+        # nuisance_ramp=True the reconstruction loss is computed on residuals with their
+        # least-squares offset + ramp removed, r -> (I - G G^+) r, G = [1, x_km, y_km] over the
+        # observation points -- exactly equivalent to fitting 3 free nuisance parameters per
+        # acquisition. Point/MLP path only. Default off -> legacy configs unchanged.
+        self.nuisance_ramp = bool(config['trainer']['phys_vae'].get('nuisance_ramp', False))
+        if self.nuisance_ramp:
+            if config['arch']['args'].get('encoder_type', 'mlp') != 'mlp':
+                raise ValueError("nuisance_ramp is implemented for the point/MLP path only")
+            if config['arch']['phys_vae'].get('iterative_refinement', {}).get('enabled', False):
+                raise ValueError("nuisance_ramp is not wired into the iterative-refinement per-pass loss")
+            x_km = self.model.physics_model.model.x.double() / 1e3
+            y_km = self.model.physics_model.model.y.double() / 1e3
+            G = torch.stack([torch.ones_like(x_km), x_km, y_km], dim=1)          # [N, 3]
+            self._ramp_G = G.float().to(self.device)
+            self._ramp_G_pinv = torch.linalg.pinv(G).float().to(self.device)     # [3, N]
+            print(f"  [nuisance_ramp] ON: per-acquisition offset + planar ramp projected out of the "
+                  f"reconstruction residual ({G.shape[0]} points)")
+
+        # Per-phase wall-clock timing (utils/timing.py): data fetch, encode, physics decode,
+        # residual decode, loss, backward, optimiser step, bookkeeping, validation, checkpoint.
+        # Written per epoch to <save_dir>/timing_epochs.csv and summarised in compute_usage.json.
+        self.timer = PhaseTimer(enabled=config['trainer'].get('timing', {}).get('enabled', True))
+        if not self.no_phy:
+            self.timer.attach_module(self.model.physics_model, 'physics_decode',
+                                     within='decode', remainder_name='residual_decode')
+        self.timing_csv = os.path.join(str(self.checkpoint_dir), 'timing_epochs.csv')
+        self.n_samples_seen = 0
+
         # NEW: Temporal smoothness regularization for the source geometry params.
         self.temporal_smoothness_weight = config['trainer']['phys_vae'].get('temporal_smoothness_weight', 0.0)
         # Which leading z_phy dims are the "location/geometry" params to keep
@@ -84,7 +228,47 @@ class PhysVAETrainerSMPL(BaseTrainer):
             self.temporal_smoothness_dims = 3
         # Never request more dims than exist.
         self.temporal_smoothness_dims = min(self.temporal_smoothness_dims, self.dim_z_phy)
-        
+        # NEW: temporal-smoothness FORM. 'variance' (default, legacy) penalises the variance
+        # of each smoothed param across the window -> zero only if the param is CONSTANT
+        # (correct for a static source). 'curvature' penalises the discrete second time
+        # difference (z[t+1]-2z[t]+z[t-1])^2 -> zero for ANY linear trend, so a constant-
+        # velocity source move or a linear dV ramp is not penalised, only jitter/kinks.
+        self.temporal_smoothness_mode = config['trainer']['phys_vae'].get('temporal_smoothness_mode', 'variance')
+        if self.temporal_smoothness_mode not in ('variance', 'curvature'):
+            raise ValueError(
+                f"temporal_smoothness_mode must be 'variance' or 'curvature', "
+                f"got '{self.temporal_smoothness_mode}'.")
+        # NEW: also smooth the dV (amplitude) dim, not just geometry. Off by default so the
+        # amplitude stays free (legacy behaviour). Only meaningful with 'curvature' when dV
+        # genuinely ramps; with 'variance' it assumes the amplitude is constant. Reuses
+        # self._dv_dim ('dV' for Mogi/Sun69, 'opening' for Okada)
+        # (set above; None for no_phy / Okada -> this flag is then a safe no-op).
+        self.temporal_smoothness_include_dv = config['trainer']['phys_vae'].get('temporal_smoothness_include_dv', False)
+        # Explicit list of smoothed z_phy dims. Single source: the leading geometry dims (+ dV).
+        # K sources: the location/depth dims (xcen, ycen, d) of EVERY source (+ every dV).
+        if self._n_sources > 1:
+            n_per_source = len(self.model.physics_model.z_phy_ranges)
+            self._smoothed_dims = [k * n_per_source + j for k in range(self._n_sources) for j in range(3)]
+        else:
+            self._smoothed_dims = list(range(self.temporal_smoothness_dims))
+        if self.temporal_smoothness_include_dv:
+            self._smoothed_dims += [d for d in self._dv_dims if d not in self._smoothed_dims]
+        if self._n_sources > 1:
+            print(f"  [multi-source] n_sources={self._n_sources}: dV dims {self._dv_dims}, "
+                  f"temporal-smoothness dims {self._smoothed_dims}")
+        # Announce the active regularizer (easy to miss in a config diff). NOTE on weight
+        # scale: rec_loss = mse_loss = SUM over the ~16384 pixels then mean over batch
+        # (model/loss.py), so it is O(1e3-1e4); the smoothness term is a mean over only a
+        # few params x time points, so it is O(1e-2). The weight must therefore be O(1e3-1e4)
+        # to contribute a non-trivial ~1-10% of rec_loss - a weight of O(0.1-1) is effectively
+        # OFF. Tune by watching (temporal_smoothness_weight * temporal_smoothness) vs rec_loss.
+        if self.temporal_smoothness_weight > 0.0 and not self.no_phy:
+            k_ts = len(self._smoothed_dims)
+            print(f"  [temporal_smoothness] ON: mode={self.temporal_smoothness_mode}, "
+                  f"weight={self.temporal_smoothness_weight}, include_dv={self.temporal_smoothness_include_dv}, "
+                  f"smoothed dims={k_ts} (geometry[:{self.temporal_smoothness_dims}]"
+                  f"{'+' + str(self._dv_name) if (self.temporal_smoothness_include_dv and self._dv_dim is not None) else ''})")
+
         # NEW: EMA prior configuration
         self.use_ema_prior = config['trainer']['phys_vae'].get('use_ema_prior', False)
 
@@ -107,6 +291,8 @@ class PhysVAETrainerSMPL(BaseTrainer):
             'coeff_penalty',  # coefficient L2 penalty
             'delta_penalty',  # delta L2 penalty
             'edge_penalty',  # edge penalty for z_phy
+            'dv_l1_penalty',  # L1 sparsity penalty on the dV latent (toward dV=0)
+            'dv_l2_penalty',  # L2 (quadratic) sparsity penalty on the dV latent (toward dV=0)
             'temporal_smoothness',  # temporal smoothness penalty for Mogi source
             'c_norm',  # norm of coefficient vector
             'delta_norm',  # norm of residual vector
@@ -139,6 +325,77 @@ class PhysVAETrainerSMPL(BaseTrainer):
 
         # NEW: Store initial learning rate for pretraining
         self.initial_lr = self.optimizer.param_groups[0]['lr']
+
+        # ====================================================================
+        # NEW: Per-sample CAUSAL TEMPORAL PRIOR (Option A).
+        # Replaces the static N(0,I) physics prior with a temporal-continuity
+        # prior: for epoch t the u_phy KL is pulled toward epoch (t-1)'s CURRENT
+        # estimate, held in an online EMA buffer. This couples the otherwise
+        # independent per-epoch (amortized) InSAR inversions into a Gaussian
+        # random-walk over the parameter track, in ONE training run.
+        # Scope: Stage-A per-epoch point/MLP InSAR path (one sample == one epoch,
+        # dataset carries a scalar 'epoch_idx'). Not for the CNN or seq paths.
+        # ====================================================================
+        tp_cfg = config['arch']['phys_vae'].get('temporal_prior', {})
+        self.use_temporal_prior = tp_cfg.get('enabled', False)
+        self.tp_ema_decay = float(tp_cfg.get('ema_decay', 0.9))  # buffer smoothing across steps
+        if self.use_temporal_prior and not self.no_phy:
+            # The temporal prior acts ONLY through the physics-KL term, which is weighted
+            # by beta_z_phy (=0 unless use_kl_term_z_phy=True with beta_max_z_phy>0). Fail
+            # loud instead of silently training a zero-weighted (inert) temporal prior.
+            if not self.use_kl_term_z_phy or self.beta_max_z_phy <= 0.0:
+                raise ValueError(
+                    "temporal_prior.enabled=True requires trainer.phys_vae.use_kl_term_z_phy=True "
+                    f"and beta_max_z_phy>0 (got use_kl_term_z_phy={self.use_kl_term_z_phy}, "
+                    f"beta_max_z_phy={self.beta_max_z_phy}); otherwise the temporal KL is "
+                    "zero-weighted and the prior is silently inert.")
+            # NOTE: the EMA buffer below is NOT persisted in checkpoints, so resuming
+            # (-r) cold-starts it to zeros. This feature is designed for ONE uninterrupted
+            # training run; resume will transiently re-warm the buffer.
+            # Prior std per parameter (temporal-coupling strength). Reuse the existing
+            # location/geometry vs amplitude split: the leading temporal_smoothness_dims
+            # (Mogi [:3], Okada [:7]) are slowly-varying geometry -> tight std (strong
+            # pull); the rest (dV / opening) are genuinely episodic -> loose std so the
+            # encoder can still track fast amplitude change per epoch.
+            tp_prior_std = float(tp_cfg.get('prior_std', 1.0))
+            tp_loc_std = float(tp_cfg.get('loc_std', tp_prior_std))
+            tp_amp_std = float(tp_cfg.get('amp_std', tp_prior_std))
+            k_loc = self.temporal_smoothness_dims
+            std_vec = np.full(self.dim_z_phy, tp_prior_std, dtype=np.float64)
+            std_vec[:k_loc] = tp_loc_std   # location/geometry group (tight)
+            std_vec[k_loc:] = tp_amp_std   # amplitude group (loose)
+            # Guard a zero/negative std; then convert to log-variance and clamp to the
+            # SAME [-9, 5] range kldiv_normal_normal (utils/utils.py) clamps to, so the
+            # requested std is exactly what training uses (no silent floor/cap).
+            std_vec = np.clip(std_vec, 1e-3, None)
+            tp_lnvar = np.clip(2.0 * np.log(std_vec), -9.0, 5.0).astype(np.float32)
+            self.temporal_prior_lnvar = torch.tensor(tp_lnvar, device=self.device)  # (dim_z_phy,)
+
+            # Online buffer of per-epoch u-space MEANS, indexed by chronological epoch
+            # ordinal. Init to zeros: in u-space sigmoid(0)=0.5 = center of every
+            # parameter's [min,max] box, so the temporal prior STARTS identical to the
+            # old N(0,I) center prior and becomes temporal as the buffer fills.
+            n_epoch_total = len(self.data_loader.dataset)
+            self.temporal_prior_mean = torch.zeros(
+                n_epoch_total, self.dim_z_phy, device=self.device)
+
+            # Every epoch ordinal must appear in the TRAINING loader, else its buffer
+            # slot never updates and its neighbour's prior goes stale. BaseDataLoader
+            # splits validation by randomly holding out indices, so require a 0 split
+            # (InSAR configs use a separate data_dir_valid).
+            val_split = config['data_loader']['args'].get('validation_split', 0.0)
+            if val_split and float(val_split) > 0.0:
+                raise ValueError(
+                    f"temporal_prior requires validation_split=0 (got {val_split}); "
+                    "otherwise held-out epochs never update their buffer slot. "
+                    "Use a separate data_dir_valid.")
+            std_report = np.exp(0.5 * tp_lnvar).round(3).tolist()
+            print(f"  [temporal_prior] enabled: {n_epoch_total} epochs, "
+                  f"ema_decay={self.tp_ema_decay}, loc dims [:{k_loc}], "
+                  f"prior std per param = {std_report}")
+        else:
+            self.temporal_prior_mean = None
+            self.temporal_prior_lnvar = None
 
     def _train_epoch(self, epoch):
         self.model.train()
@@ -175,8 +432,10 @@ class PhysVAETrainerSMPL(BaseTrainer):
         u2_sum = None
         u_count = 0
 
+        t_mark = time.perf_counter()
         for batch_idx, data_dict in enumerate(self.data_loader):
             data = data_dict[self.data_key].to(self.device)
+            self.timer.add('data_fetch', time.perf_counter() - t_mark)
             input_const = {k: data_dict[k].to(self.device) for k in self.input_const_keys} if self.input_const_keys else None
             
             # Get time features if available
@@ -185,6 +444,17 @@ class PhysVAETrainerSMPL(BaseTrainer):
                 time_feats = time_feats.to(self.device)
                 if time_feats.dim() == 3:  # For sequence data
                     time_feats = time_feats.view(-1, time_feats.size(-1))
+
+            # Chronological epoch ordinal per sample (Stage-A point/MLP InSAR path only),
+            # used by the causal temporal prior. Absent on GPS/CSV/seq/CNN paths.
+            epoch_idx = data_dict.get('epoch_idx', None)
+            if epoch_idx is not None:
+                epoch_idx = epoch_idx.to(self.device).long()
+            if self.use_temporal_prior and epoch_idx is None:
+                raise ValueError(
+                    "temporal_prior is enabled but the batch has no 'epoch_idx'. "
+                    "It is only supported on the Stage-A per-epoch point/MLP InSAR "
+                    "path (DisplacementInSARh5); disable temporal_prior otherwise.")
 
             # Full-field CNN path: data is a [B, C, H, W] image with a coherence 'mask'.
             rec_mask = data_dict.get('mask', None)
@@ -204,12 +474,13 @@ class PhysVAETrainerSMPL(BaseTrainer):
             # reconstruction loss; the final pass feeds the usual draw/decode/KL path below.
             # During pretraining the loss is purely the synthetic bootstrap, so the iterative
             # multi-pass encode would just waste K-1 forward passes -> use a single pass then.
-            if self.use_iterative and not self.no_phy and epoch >= self.epochs_pretrain:
-                all_z_phy_stats, z_aux_stat = self.model.encode_iterative(data, time_feats)
-                z_phy_stat = all_z_phy_stats[-1]
-            else:
-                all_z_phy_stats = None
-                z_phy_stat, z_aux_stat = self.model.encode(data, time_feats)
+            with self.timer.phase('encode'):
+                if self.use_iterative and not self.no_phy and epoch >= self.epochs_pretrain:
+                    all_z_phy_stats, z_aux_stat = self.model.encode_iterative(data, time_feats)
+                    z_phy_stat = all_z_phy_stats[-1]
+                else:
+                    all_z_phy_stats = None
+                    z_phy_stat, z_aux_stat = self.model.encode(data, time_feats)
 
             # NEW: Update EMA prior statistics (if enabled) - only after pretraining phase
             if self.use_ema_prior and not self.no_phy and epoch > 1 + self.epochs_pretrain:
@@ -219,8 +490,12 @@ class PhysVAETrainerSMPL(BaseTrainer):
             # Use separate deterministic sampling for each latent variable based on their KL term settings
             hard_z_phy = not self.use_kl_term_z_phy  # Use deterministic sampling when KL term is disabled
             hard_z_aux = not self.use_kl_term_z_aux  # Use deterministic sampling when KL term is disabled
-            z_phy, z_aux = self.model.draw(z_phy_stat, z_aux_stat, hard_z_phy=hard_z_phy, hard_z_aux=hard_z_aux)
-            x_PB, x_P, y, delta, c = self.model.decode(z_phy, z_aux, epoch=epoch, epochs_pretrain=self.epochs_pretrain, full=True, const=input_const)
+            with self.timer.phase('encode'):
+                z_phy, z_aux = self.model.draw(z_phy_stat, z_aux_stat, hard_z_phy=hard_z_phy, hard_z_aux=hard_z_aux)
+            # 'decode' is split by the physics forward hook into physics_decode + residual_decode.
+            with self.timer.phase('decode'):
+                x_PB, x_P, y, delta, c = self.model.decode(z_phy, z_aux, epoch=epoch, epochs_pretrain=self.epochs_pretrain, full=True, const=input_const)
+            t_mark = time.perf_counter()
 
             # Losses - Get separate KL terms for flexible combination
             # For the CNN image path, flatten the target image (row-major over H,W to match
@@ -230,7 +505,35 @@ class PhysVAETrainerSMPL(BaseTrainer):
                 rec_mask_flat = rec_mask.reshape(rec_mask.size(0), -1) if rec_mask is not None else None
             else:
                 rec_target, rec_mask_flat = data, None
-            rec_loss, kl_u_phy, kl_z_aux = self._vae_loss(rec_target, z_phy_stat, z_aux_stat, x_PB, mask=rec_mask_flat)
+            # Nuisance offset + ramp: project both target and prediction (linear), so the MSE is
+            # that of the ramp-removed residual.
+            x_PB_for_loss = x_PB
+            if self.nuisance_ramp:
+                rec_target, x_PB_for_loss = self._remove_ramp(rec_target), self._remove_ramp(x_PB)
+            # epoch_idx activates the causal temporal prior in _vae_loss (training only;
+            # validation stays on the standard N(0,I)/EMA prior with epoch_idx=None).
+            rec_loss, kl_u_phy, kl_z_aux = self._vae_loss(rec_target, z_phy_stat, z_aux_stat, x_PB_for_loss, mask=rec_mask_flat, epoch_idx=epoch_idx)
+
+            # NEW: Update the causal temporal-prior buffer with this batch's u-space
+            # posterior means (detached), EMA-smoothed per epoch ordinal. Done AFTER
+            # _vae_loss so that the prior lookup buffer[t-1] reads only values written by
+            # EARLIER batches/epochs (strict causality) — updating before the loss would
+            # let a same-batch neighbour t-1 leak its current-step estimate into t's prior.
+            # Done every batch (incl. pretraining) so neighbours are warm when the u_phy KL
+            # switches on. buffer[e] <- d*buffer[e] + (1-d)*mu_e.
+            if self.use_temporal_prior and not self.no_phy and epoch_idx is not None:
+                # No-replacement sampler => each epoch ordinal appears at most once per
+                # batch, so the indexed assignment below is well-defined. Assert it so a
+                # future WeightedRandomSampler / repeat-augmentation can't silently make
+                # the update pick an arbitrary duplicate write.
+                assert epoch_idx.unique().numel() == epoch_idx.numel(), (
+                    "temporal_prior buffer update requires unique epoch_idx per batch "
+                    "(no-replacement sampler); got duplicates.")
+                with torch.no_grad():
+                    mu = z_phy_stat['mean'].detach()                 # (n, dim_z_phy)
+                    d = self.tp_ema_decay
+                    prev = self.temporal_prior_mean[epoch_idx]       # (n, dim_z_phy)
+                    self.temporal_prior_mean[epoch_idx] = d * prev + (1.0 - d) * mu
 
             # NEW: Iterative refinement per-pass reconstruction loss.
             # Supervise only the INTERMEDIATE passes (0 .. K-2) with a physics-only
@@ -289,7 +592,40 @@ class PhysVAETrainerSMPL(BaseTrainer):
 
             # NEW: Edge penalty for z_phy to avoid extreme values (0, 1)
             edge_penalty = self._edge_penalty(z_phy)
-            
+
+            # NEW: dV sparsity penalty. Only the dV dim is penalised; geometry
+            # (xcen, ycen, depth) is left untouched. No-op when dV dim is absent.
+            #   dv_penalty_space='z' (legacy): |z_dV - z0| in post-sigmoid (0,1) space.
+            #       z_phy = sigmoid(u), so the gradient wrt the optimised u carries a z(1-z)
+            #       slope factor that vanishes at the rail (z->0/1) -- powerless exactly where
+            #       dV rails, and no larger weight can fix a ~0 gradient.
+            #   dv_penalty_space='u': |u_dV - u0| in pre-sigmoid space, u0 = self._dv_u_center
+            #       (= logit(z0)). u is unbounded/linear -> constant, non-vanishing pull that
+            #       reaches a railed dV. z_phy_stat['mean'] IS the raw u-space posterior mean.
+            _use_u = (self.dv_penalty_space == 'u')
+            # Summed over sources (one source -> identical to the old single-dim value), so each
+            # of K sources feels the same pull toward dV=0 it would feel alone.
+            if self.dv_l1_weight > 0.0 and self._dv_dims:
+                if _use_u:
+                    dv_l1_penalty = (z_phy_stat['mean'][..., self._dv_dims] - self._dv_u_center).abs().sum(dim=-1).mean()
+                elif z_phy is not None:
+                    dv_l1_penalty = (z_phy[..., self._dv_dims] - self._dv_z_center).abs().sum(dim=-1).mean()
+                else:
+                    dv_l1_penalty = torch.tensor(0.0, device=data.device)
+            else:
+                dv_l1_penalty = torch.tensor(0.0, device=data.device)
+
+            # dV L2 (quadratic) penalty toward the same centre, in the same space as L1.
+            if self.dv_l2_weight > 0.0 and self._dv_dims:
+                if _use_u:
+                    dv_l2_penalty = (z_phy_stat['mean'][..., self._dv_dims] - self._dv_u_center).pow(2).sum(dim=-1).mean()
+                elif z_phy is not None:
+                    dv_l2_penalty = (z_phy[..., self._dv_dims] - self._dv_z_center).pow(2).sum(dim=-1).mean()
+                else:
+                    dv_l2_penalty = torch.tensor(0.0, device=data.device)
+            else:
+                dv_l2_penalty = torch.tensor(0.0, device=data.device)
+
             # NEW: Temporal smoothness regularization for Mogi source parameters
             temporal_smoothness = self._temporal_smoothness_loss(z_phy, sequence_len)
 
@@ -323,6 +659,8 @@ class PhysVAETrainerSMPL(BaseTrainer):
                             + self.coeff_penalty_weight * coeff_penalty
                             + self.delta_penalty_weight * delta_penalty
                             + self.edge_penalty_weight * edge_penalty
+                            + self.dv_l1_weight * dv_l1_penalty
+                            + self.dv_l2_weight * dv_l2_penalty
                             + self.temporal_smoothness_weight * temporal_smoothness
                             + self.iter_loss_weight * iter_loss)
                 else:
@@ -334,6 +672,8 @@ class PhysVAETrainerSMPL(BaseTrainer):
                            self.coeff_penalty_weight * coeff_penalty +
                            self.delta_penalty_weight * delta_penalty +
                            self.edge_penalty_weight * edge_penalty +
+                           self.dv_l1_weight * dv_l1_penalty +
+                           self.dv_l2_weight * dv_l2_penalty +
                            self.temporal_smoothness_weight * temporal_smoothness +
                            self.iter_loss_weight * iter_loss)
                     
@@ -341,7 +681,10 @@ class PhysVAETrainerSMPL(BaseTrainer):
                     C_t = 0.0
                     capacity_penalty = torch.tensor(0.0, device=data.device)
 
-            loss.backward()
+            self.timer.add('loss', time.perf_counter() - t_mark)
+            with self.timer.phase('backward'):
+                loss.backward()
+            t_mark = time.perf_counter()
 
             # NEW: gradient clipping for stability
             if self.grad_clip_norm > 0:
@@ -351,6 +694,9 @@ class PhysVAETrainerSMPL(BaseTrainer):
                 self._grad_stablizer(epoch, batch_idx, loss.item())
 
             self.optimizer.step()
+            self.timer.add('optimizer_step', time.perf_counter() - t_mark)
+            t_mark = time.perf_counter()
+            self.n_samples_seen += data.shape[0]
 
             # Update metrics
             self.train_metrics.update('loss', loss.item())
@@ -369,7 +715,11 @@ class PhysVAETrainerSMPL(BaseTrainer):
             
             # NEW: Track edge penalty
             self.train_metrics.update('edge_penalty', edge_penalty.item())
-            
+
+            # NEW: Track dV sparsity penalty
+            self.train_metrics.update('dv_l1_penalty', dv_l1_penalty.item())
+            self.train_metrics.update('dv_l2_penalty', dv_l2_penalty.item())
+
             # NEW: Track temporal smoothness
             self.train_metrics.update('temporal_smoothness', temporal_smoothness.item())
 
@@ -449,6 +799,8 @@ class PhysVAETrainerSMPL(BaseTrainer):
                 
                 # log_str += " (Gate: correction strength, Residual: physics vs corrected L2 diff)"
                 self.logger.info(log_str)
+            self.timer.add('bookkeeping', time.perf_counter() - t_mark)
+            t_mark = time.perf_counter()
 
         log = self.train_metrics.result()
 
@@ -522,7 +874,8 @@ class PhysVAETrainerSMPL(BaseTrainer):
 
         # Validation
         if self.do_validation:
-            val_log = self._valid_epoch(epoch)
+            with self.timer.phase('validation'):
+                val_log = self._valid_epoch(epoch)
             log.update(**{'val_' + k: v for k, v in val_log.items()})
             wandb.log({f'val/{key}': value for key, value in val_log.items()})
             wandb.log({'val/epoch': epoch})
@@ -539,12 +892,38 @@ class PhysVAETrainerSMPL(BaseTrainer):
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
 
+        self._write_timing_row(epoch)
         return log
 
-    def _save_checkpoint(self, epoch, save_best=False):
+    def _remove_ramp(self, values):
+        """(I - G G^+) applied row-wise: removes each row's least-squares offset + planar ramp."""
+        return values - (values @ self._ramp_G_pinv.T) @ self._ramp_G.T
+
+    TIMING_COLUMNS = ['epoch', 'data_fetch', 'encode', 'physics_decode', 'residual_decode', 'loss',
+                      'backward', 'optimizer_step', 'bookkeeping', 'validation', 'checkpoint_save']
+
+    def _write_timing_row(self, epoch):
+        """Append this epoch's per-phase seconds to timing_epochs.csv and log a one-line summary.
+        checkpoint_save is charged to the epoch in which the save completes (base trainer saves
+        after _train_epoch returns, so it appears in the following row)."""
+        if not self.timer.enabled:
+            return
+        row = self.timer.epoch_row(epoch)
+        new_file = not os.path.exists(self.timing_csv)
+        with open(self.timing_csv, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=self.TIMING_COLUMNS, restval=0.0, extrasaction='ignore')
+            if new_file:
+                writer.writeheader()
+            writer.writerow(row)
+        parts = ' | '.join(f"{k} {v:.2f}s" for k, v in row.items() if k != 'epoch')
+        self.logger.info(f"Epoch {epoch} timing: {parts}")
+
+    def _save_checkpoint(self, epoch, save_best=False, epoch_file=True):
         """
-        Override to save tau/r values for inference
+        Override to save tau/r values for inference. epoch_file=False skips checkpoint-epoch<N>.pth (mid-run best
+        saves, see BaseTrainer.train).
         """
+        t_save0 = time.perf_counter()
         arch = type(self.model).__name__
         
         # Get current tau/r values
@@ -562,13 +941,15 @@ class PhysVAETrainerSMPL(BaseTrainer):
             'tau_r_values': tau_r_values  # Save tau/r values for inference
         }
         
-        filename = str(self.checkpoint_dir / 'checkpoint-epoch{}.pth'.format(epoch))
-        torch.save(state, os.path.join(PARENT_DIR, filename))
-        self.logger.info("Saving checkpoint: {} ...".format(filename))
+        if epoch_file:
+            filename = str(self.checkpoint_dir / 'checkpoint-epoch{}.pth'.format(epoch))
+            torch.save(state, os.path.join(PARENT_DIR, filename))
+            self.logger.info("Saving checkpoint: {} ...".format(filename))
         if save_best:
             best_path = str(self.checkpoint_dir / 'model_best.pth')
             torch.save(state, os.path.join(PARENT_DIR, best_path))
-            self.logger.info("Saving current best: model_best.pth ...")
+            self.logger.info("Saving current best: model_best.pth (epoch {}) ...".format(epoch))
+        self.timer.add('checkpoint_save', time.perf_counter() - t_save0)
 
     def _valid_epoch(self, epoch):
         self.model.eval()
@@ -620,7 +1001,10 @@ class PhysVAETrainerSMPL(BaseTrainer):
                         rec_mask_flat = rec_mask.reshape(rec_mask.size(0), -1) if rec_mask is not None else None
                     else:
                         rec_target, rec_mask_flat = data, None
-                    rec_loss, kl_u_phy, kl_z_aux = self._vae_loss(rec_target, z_phy_stat, z_aux_stat, x_PB, mask=rec_mask_flat)
+                    x_PB_for_loss = x_PB
+                    if self.nuisance_ramp:
+                        rec_target, x_PB_for_loss = self._remove_ramp(rec_target), self._remove_ramp(x_PB)
+                    rec_loss, kl_u_phy, kl_z_aux = self._vae_loss(rec_target, z_phy_stat, z_aux_stat, x_PB_for_loss, mask=rec_mask_flat)
                     kl_loss = kl_u_phy + kl_z_aux # Original behavior: combine first, then average
                     
                     # Compute residual_loss for validation (L2 difference)
@@ -651,7 +1035,7 @@ class PhysVAETrainerSMPL(BaseTrainer):
         self.logger.info(f"Validation Epoch: {epoch} Rec Loss: {avg_rec_loss:.6f} KL Loss: {avg_kl_loss:.6f} Residual: {avg_residual_loss:.6f} residual_rel_diff: {avg_residual_rel_diff:.2f}% (Physics vs Corrected)")
         return self.valid_metrics.result()
 
-    def _vae_loss(self, data, z_phy_stat, z_aux_stat, x, pretrain=False, mask=None):
+    def _vae_loss(self, data, z_phy_stat, z_aux_stat, x, pretrain=False, mask=None, epoch_idx=None):
         """
         VAE loss function that returns separate KL terms for flexible combination.
         Returns: rec_loss, kl_u_phy, kl_z_aux (separate terms for both modes)
@@ -659,6 +1043,11 @@ class PhysVAETrainerSMPL(BaseTrainer):
         mask : optional [B, D] (1=valid, 0=incoherent). When given (CNN full-field path),
                reconstruction is masked-MSE over valid cells only, so incoherent pixels do
                not contribute. When None, the configured criterion is used (point/GPS path).
+        epoch_idx : optional (n,) LongTensor of chronological epoch ordinals. When given AND
+               temporal_prior is enabled, the physics-KL prior MEAN is set per-sample to
+               epoch (t-1)'s current estimate from the temporal buffer (causal temporal
+               prior), instead of the static N(0,I)/EMA prior. Pass None (default) to keep
+               the standard prior (validation path, or non-InSAR-point paths).
         """
         if mask is not None:
             sq_err = (x - data).pow(2) * mask
@@ -672,10 +1061,30 @@ class PhysVAETrainerSMPL(BaseTrainer):
 
         # Physics KL in u-space (per-sample, not averaged yet)
         if not self.no_phy:
-            KL_u_phy = kldiv_normal_normal(
-                z_phy_stat['mean'], z_phy_stat['lnvar'],
-                prior_u_phy_stat['mean'], prior_u_phy_stat['lnvar']
-            ).mean()     # a scalar value, average of per-sample KL
+            if self.use_temporal_prior and epoch_idx is not None:
+                # Causal temporal prior: pull epoch t toward epoch (t-1)'s current guess.
+                # Prior mean = buffer[t-1]; prior lnvar = fixed loc/amp split.
+                prev = (epoch_idx - 1).clamp(min=0)
+                prior_mean = self.temporal_prior_mean[prev].clone()      # (n, dim_z_phy)
+                # .repeat (not .expand) so the epoch-0 rows below are writable.
+                prior_lnvar = self.temporal_prior_lnvar.unsqueeze(0).repeat(n, 1)  # (n, dim_z_phy)
+                # Epoch 0 (MintPy reference date, displacement identically 0) has no
+                # predecessor -> full standard-normal cold start N(0,1): mean 0 AND
+                # std 1 (lnvar 0). Must reset BOTH; leaving the tight loc lnvar here would
+                # wrongly pin epoch 0's geometry to the box centre with the strongest pull
+                # in the whole series.
+                is_epoch0 = (epoch_idx == 0)
+                prior_mean[is_epoch0] = 0.0
+                prior_lnvar[is_epoch0] = 0.0
+                KL_u_phy = kldiv_normal_normal(
+                    z_phy_stat['mean'], z_phy_stat['lnvar'],
+                    prior_mean, prior_lnvar
+                ).mean()
+            else:
+                KL_u_phy = kldiv_normal_normal(
+                    z_phy_stat['mean'], z_phy_stat['lnvar'],
+                    prior_u_phy_stat['mean'], prior_u_phy_stat['lnvar']
+                ).mean()     # a scalar value, average of per-sample KL
         else:
             KL_u_phy = torch.zeros(n, device=self.device).mean()
 
@@ -780,20 +1189,28 @@ class PhysVAETrainerSMPL(BaseTrainer):
 
     def _temporal_smoothness_loss(self, z_phy, sequence_len):
         """
-        Temporal smoothness regularization for the source location/geometry params.
-        Encourages minimal variance in the leading geometry dimensions within each
-        temporal sequence, while leaving the amplitude dimension free to vary.
+        Temporal smoothness regularization for the source parameters, computed over the
+        leading geometry dims (and optionally dV) across each temporal sequence window.
 
-        The number of smoothed dimensions is set in __init__ by physics type:
-            Mogi  -> 3 (xcen, ycen, d;            dV free)
+        The number of smoothed geometry dims is set in __init__ by physics type:
+            Mogi  -> 3 (xcen, ycen, d;            dV free unless include_dv)
             Okada -> 7 (xoff,yoff,depth,strike,dip,length,width; opening free)
+        If self.temporal_smoothness_include_dv is True and an amplitude dim exists
+        (self._dv_dim -- 'dV' for Mogi/Sun69, 'opening' for Okada;
+        Mogi/Sun69; None for Okada), the dV dim is added to the smoothed set.
+
+        Two forms (self.temporal_smoothness_mode):
+          'variance'  -> mean over dims of Var_t(z)   [zero only if param is CONSTANT]
+          'curvature' -> mean over dims,t of (z[t+1]-2z[t]+z[t-1])^2   [zero for any
+                         LINEAR trend; only jitter/kinks penalised]. Needs seq_len >= 3.
 
         Args:
-            z_phy: Physical variables tensor of shape (batch_size * seq_len, dim_z_phy)
+            z_phy: Physical variables tensor of shape (batch_size * seq_len, dim_z_phy),
+                   z in (0,1) (sigmoid of the u-space latent).
             sequence_len: Length of temporal sequences (None if not using sequences)
 
         Returns:
-            Temporal smoothness penalty: variance of geometry coordinates within sequences
+            Scalar temporal-smoothness penalty (0 tensor when inapplicable).
         """
         if self.no_phy or z_phy is None or sequence_len is None:
             return torch.tensor(0.0, device=self.device)
@@ -806,13 +1223,26 @@ class PhysVAETrainerSMPL(BaseTrainer):
 
         z_phy_seq = z_phy.view(batch_size, sequence_len, -1)  # (batch_size, seq_len, dim_z_phy)
 
-        # Apply smoothness to the leading geometry dimensions (physics-dependent).
-        n_dims = self.temporal_smoothness_dims
-        geometry_coords = z_phy_seq[:, :, :n_dims]  # (batch_size, seq_len, n_dims)
+        # Which parameter dims to keep smooth: leading geometry dims, optionally plus dV.
+        # Built in __init__ (geometry dims of every source, + dV dims if include_dv).
+        coords = z_phy_seq[:, :, self._smoothed_dims]  # (batch_size, seq_len, n_smoothed)
 
-        # Compute variance across the sequence dimension for each batch
-        # var across seq_len dimension: (batch_size, n_dims)
-        coord_variance = torch.var(geometry_coords, dim=1)  # (batch_size, n_dims)
+        if self.temporal_smoothness_mode == 'curvature':
+            # Discrete second time difference; zero for any straight line / constant, so a
+            # constant-velocity source move or a linear dV ramp is NOT penalised.
+            # NOTE (why z-space, not u-space): the decoder z->physical map is AFFINE
+            # (model_phys_smpl.rescale: z*(max-min)+min, geometry x1000, dV x scale+shift),
+            # so "linear in physical units" <=> "linear in z". The synthetic truths are
+            # piecewise-linear in physical units, hence linear in z, hence zero z-curvature.
+            # Penalising in u-space (u=logit(z)) would instead penalise the true linear ramp,
+            # because logit is nonlinear. So z-space is correct HERE; revisit only if any
+            # param's z->physical map is ever made nonlinear (e.g. log-depth).
+            if sequence_len < 3:
+                # Curvature is undefined for windows shorter than 3 epochs.
+                return torch.tensor(0.0, device=self.device)
+            second_diff = coords[:, 2:, :] - 2.0 * coords[:, 1:-1, :] + coords[:, :-2, :]
+            return second_diff.pow(2).mean()
 
-        # Return mean variance across all batches and geometry dimensions
+        # 'variance' mode (default): variance across the seq_len (time) axis per param.
+        coord_variance = torch.var(coords, dim=1)  # (batch_size, n_smoothed)
         return coord_variance.mean()

@@ -306,6 +306,129 @@ the new prior). `plot_insar_results.py` now writes the prior box + a per-paramet
 flag into `*_params.txt` and a footnote on the maps figure (validated on the old railed
 TD124 run: flags `xoff, yoff` at ±15 km). Field re-runs + re-validation pending submission.
 
+## 6. Temporal-prior regularization: curvature × dV-L1 grid (2026-07-28)
+
+**Context.** PILA inverts the InSAR cube **per epoch** (amortized), so each epoch's
+source parameters are estimated independently — there is no built-in temporal coupling,
+and the recovered trajectories carry large **incoherent epoch-to-epoch jitter**, worst
+where the source is quiescent and the geometry is weakly identifiable. Two regularizers
+were developed separately to inject temporal/physical priors without abandoning the
+amortized encoder:
+
+- **Temporal curvature smoothing** — penalise the 2nd time-difference
+  `(z[t+1] − 2·z[t] + z[t−1])²` of the source parameters (`temporal_smoothness_mode:
+  "curvature"`, `include_dv:true`), computed in the affine z-space over sequence windows.
+  It penalises *jerk*, not level, so a smooth genuine ramp survives while incoherent
+  jitter is suppressed. Needs the **Seq** loader (`InSARSeqh5DataLoader`, seq_len 7) for
+  `sequence_len`. Weight must be **O(1e3–1e4)** because `rec_loss` sums over 16384 px.
+- **dV-L1 in u-space** — an L1 pull of the dV parameter toward its center in
+  **pre-sigmoid (u) space** (`dv_penalty_space:"u"`). In post-sigmoid z-space the gradient
+  carries a `z(1−z)` factor that vanishes at the rail — powerless exactly where dV rails to
+  0; in u-space the pull is constant and non-vanishing, so quiescent epochs collapse to
+  dV≈0 while the late high-dV rise is preserved.
+
+**Question.** Do the two combine as hoped — curvature kills the jitter, dV-L1 drags the
+residual flat level the rest of the way to 0 — or does one dominate? Run the 2D grid.
+
+**Cube.** `marapi_mogi_rising_combined` (76 epochs): a **moving + rising** Mogi source —
+xcen −6000→+6000 m, ycen −4000→+4000 m, depth 7000→2000 m, dV a **sigmoid 1e6→8e7 m³**
+(peak epoch 75), ECMWF/MatAPS-style APS noise.
+
+**Setup.** `generate_combined_curvdvl1u_jobs.py` clones the validated single-penalty
+template `configs/synth/marapi_mogi_rising_combined_tscurv_lam15000.json`, flipping only
+the two penalty weights + `dv_penalty_space:"u"`, and emits 6 configs + 6 PBS scripts.
+The two penalties are **independent additive loss terms**
+(`trainer/trainer_phys_smpl.py:561,563`), so both are active in one run; the Seq train
+loader / `InSARh5DataLoader` `type_test` pair is preserved (dV-L1 is per-sample, agnostic
+to sequence structure; the per-epoch dump needs the non-Seq test loader). Grid = curvature
+`temporal_smoothness_weight` ∈ **{5000, 15000}** × dV-L1 `dv_l1_weight` ∈ **{30, 100, 300}**.
+PBS **3761875–3761880**, all clean (77-row `uspace_series.csv` + plots each).
+
+**How the two loss terms are computed (exact).** Both are additive terms in the total
+loss (`trainer/trainer_phys_smpl.py:561,563` and `:574,576`), scaled by their weights.
+Let `z ∈ (0,1)` be the sigmoid of the u-space latent, `u = logit(z)` the pre-sigmoid
+latent, and let the decoder map `z → physical` affinely (`z·(max−min)+min`, geometry
+×1000, dV ×scale+shift).
+
+- **Temporal curvature smoothness** (`_temporal_smoothness_loss`, `:1049-1109`). Reshape
+  `z_phy` to `(batch, seq_len, dim_z_phy)`, keep the smoothed dims (Mogi geometry xcen,
+  ycen, d; +dV since `include_dv:true`), take the **discrete 2nd time-difference** and
+  mean-square it:
+  ```
+  L_curv = mean_over(batch, t, dims) [ ( z[t+1] − 2·z[t] + z[t−1] )² ]      (seq_len ≥ 3)
+  ```
+  It is computed in **z-space, not u-space**, on purpose: the z→physical map is affine, so
+  "linear in physical units ⇔ linear in z", and the synthetic truths are piecewise-linear
+  in physical units → **zero z-curvature for a constant-velocity move or a linear dV ramp**;
+  only jitter/kinks are penalised. (u-space would penalise the true linear ramp because
+  logit is nonlinear.) Needs the Seq loader for `sequence_len`.
+
+- **dV-L1 in u-space** (`:507-515`). Penalise the **absolute deviation of the dV latent
+  from its center in pre-sigmoid space**, averaged over the batch:
+  ```
+  L_dVL1 = mean_over(batch) | u_dV − u0 |,   u0 = logit(z0)
+  ```
+  where `u_dV` is the raw u-space posterior mean (`z_phy_stat['mean'][…, dv_dim]`) and `z0`
+  is the physical-zero point of the affine dV map (`:127`, `z0 = ((−shift/scale) − min)/
+  (max−min)`). Under `mogi_paras_symdV.json` (scale 1, shift 0, dV range ±2e8) `z0 = 0.5`,
+  so `u0 = logit(0.5) = 0` and the term reduces to `mean |u_dV|`. Acting in **u-space** is
+  the whole point: the z-space gradient carries a `z(1−z)` factor that vanishes at the rail
+  (z→0/1), so a z-space L1 is powerless exactly where dV rails to 0; the u-space pull is
+  constant and non-vanishing, collapsing quiescent epochs to dV≈0 while sparing the rise.
+
+**Metric.** Fluctuation-RMSE vs truth per parameter (`compare_prior_variants.py`),
+reported all-epoch (% of truth RMS) and **excluding gated** epochs (truth |dV| < 5% peak,
+where geometry is unidentifiable). 4-way vs the two single-penalty baselines:
+
+| param | Baseline (no prior) | Curvature 15000 | dV-L1(u) 100 | **Combined (curv15000 + dV-L1 300)** |
+|---|---|---|---|---|
+| xcen (m) | 6.75e3 (192%) \| 7.2e3 | 1.32e3 (37%) \| **402** | 2.83e3 (81%) \| 1.65e3 | 1.26e3 (36%) \| 585 |
+| ycen (m) | 3.42e3 (146%) \| 2.28e3 | 1.43e3 (61%) \| 408 | 3.39e3 (145%) \| 1.67e3 | 1.45e3 (62%) \| **357** |
+| d (m) | 4.5e3 (95%) \| 4.16e3 | 2.36e3 (50%) \| 1.74e3 | 3.72e3 (79%) \| 2.89e3 | **2.13e3 (45%) \| 1.57e3** |
+| dV (m³) | 8.99e7 (169%) \| 8.42e7 | 3.3e7 (62%) \| 2.37e7 | 6.68e7 (126%) \| 5.05e7 | **3.12e7 (59%) \| 2.27e7** |
+
+**Key findings.**
+- **Curvature carries the result; the curvature *weight*, not dV-L1, is the dominant knob.**
+  Every curv=15000 cell beats every curv=5000 cell on dV (curv=5000 dV: 5.36 / 4.95 / 4.62e7
+  for dV-L1 30/100/300, vs curv=15000: 3.27 / 3.22 / 3.12e7).
+- **The flagged over-smoothing risk did NOT materialise.** 15000 is *better* than 5000, and
+  the combined trace still tracks the late sigmoid rise — its **gated** dV RMSE (dominated by
+  the high-dV epochs) is the lowest of all variants, so curvature-15000 is not lagging or
+  flattening the genuine dV onset.
+- **dV-L1 adds a small, monotonic nudge** on top of curvature=15000 (dV all-epoch: 3.27 →
+  3.22 → 3.12e7 for L1 = 30 → 100 → 300) — the anticipated "L1 drags the residual flat level
+  further" effect, but the gain over curvature-only is **modest (~5%)**.
+- **Winner = c15000_d300** (curvature 15000 + dV-L1(u) 300): lowest dV both all-epoch and
+  excl-gated, plus best `d` and `ycen`. Curvature-only wins only `xcen`-excl-gated (402 vs
+  585). **Practically, curvature-15000-only is ~95% of the way** — the combined prior is the
+  marginal best but the extra dV-L1 buys little on this cube.
+
+**Figures.** 4-way overlay `saved/compare_rising_combined_curvXdvl1u_4way.png/.pdf`;
+per-cell param-recovery under
+`saved/combined_curvdvl1u_marapi_mogi_rising_combined/curv{5000,15000}_dvl1u{30,100,300}/`.
+All staged flat in `scp_combined_figs/` for scp.
+
+**Reproduce.**
+```bash
+cd /eos-rs/INSAR_processing/denny/PILA
+conda activate pila
+# Regenerate the 6 configs + PBS (idempotent), then submit from a scheduler-capable shell:
+python generate_combined_curvdvl1u_jobs.py
+for f in curv5000_dvl1u30 curv5000_dvl1u100 curv5000_dvl1u300 \
+         curv15000_dvl1u30 curv15000_dvl1u100 curv15000_dvl1u300; do
+  qsub jobs/submit_combined_${f}.pbs
+done
+# Rank all cells vs the two single-penalty baselines + rebuild the 4-way figure:
+CROOT=saved/combined_curvdvl1u_marapi_mogi_rising_combined
+python compare_prior_variants.py \
+  --truth synthetic/cubes/marapi_mogi_rising_combined/marapi_mogi_rising_combined_truth.json \
+  --series "Baseline (no prior)=saved/tscurv_marapi_mogi_rising_combined/lam0/uspace_series.csv" \
+           "Curvature 15000=saved/tscurv_marapi_mogi_rising_combined/lam15000/uspace_series.csv" \
+           "dV-L1(u) 100=saved/dvl1u_marapi_mogi_rising_combined/lam100/uspace_series.csv" \
+           "Combined (curv15000 + dV-L1 300)=$CROOT/curv15000_dvl1u300/uspace_series.csv" \
+  --out saved/compare_rising_combined_curvXdvl1u_4way
+```
+
 ## Reproduce the audit numbers
 
 ```bash
@@ -330,3 +453,8 @@ for d in saved/stride_uq/*/; do echo "$d $(find "$d" -name model_best.pth | wc -
   `configs/okada_dike_paras.json` (dip 20–90°, opening 0–10 m). Definitive + UQ Okada jobs
   regenerated on the new prior; **re-runs + re-validation pending submission**, after which
   the §4b agreement counts should be re-computed.
+- Experiment **6 (2026-07-28)** tested combining temporal curvature smoothing with u-space
+  dV-L1 on the moving+rising cube. **Curvature smoothing is the dominant regularizer**
+  (weight 15000 > 5000, no dV-onset lag); dV-L1 adds only a ~5% dV nudge. Best cell
+  **c15000_d300**, but **curvature-15000-only captures ~95% of the benefit** — the combined
+  prior is marginally best, not decisively so, on this synthetic cube.
