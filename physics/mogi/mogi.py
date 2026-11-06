@@ -12,7 +12,7 @@ class Mogi():
     parameters : array
         names for the parameters in the model
     """
-    def __init__(self, x, y, nu=0.25):
+    def __init__(self, x, y, nu=0.25, dz_topo_m=None):
         super(Mogi, self).__init__()
         """
         Initialize the Mogi model with default parameters.
@@ -22,10 +22,16 @@ class Mogi():
             y (Tensor): y-coordinate of stations (1D tensor)
             nu (float): poisson's ratio for medium (default 0.25)
             mu (float): shear modulus for medium (Pa) (default 4e9)
+            dz_topo_m (Tensor or None): per-station topographic depth offset
+                (h_i - h_ref) in metres, 1D tensor like x. None = flat surface
+                (exact original code path). Built by _build_topo_offset in model/model_phys_smpl.py.
         """
         self.x = x
         self.y = y
         self.nu = nu
+        # Williams & Wadge (1998) varying-depth correction: source-to-surface
+        # separation at station i is d + (h_i - h_ref). None keeps the flat model.
+        self.dz_topo_m = dz_topo_m
 
     def cart2pol(self, x, y):
         """
@@ -83,13 +89,20 @@ class Mogi():
         # Convert to surface cylindrical coordinates
         th, rho = self.cart2pol(x_adjusted, y_adjusted) # surface angle and radial distance
 
+        # Source-to-surface vertical separation per station, [batch, N] (or
+        # [batch, 1] when flat). With topography the free surface is still flat
+        # but each station sees the source d + (h_i - h_ref) below it.
+        d_eff = d.unsqueeze(1)
+        if self.dz_topo_m is not None:
+            d_eff = d_eff + self.dz_topo_m.to(d_eff.device)
+
         # Compute radial distance from source
-        R = torch.sqrt(d.unsqueeze(1)**2 + rho**2) # radial distance from source
+        R = torch.sqrt(d_eff**2 + rho**2) # radial distance from source
 
         # Mogi displacement calculation 
         C = ((1-self.nu) / torch.pi) * dV.unsqueeze(1)
         ur = C * rho / R**3 # horizontal displacement, m
-        uz = C * d.unsqueeze(1) / R**3 # vertical displacement, m
+        uz = C * d_eff / R**3 # vertical displacement, m
 
         ux, uy = self.pol2cart(th, ur)
 

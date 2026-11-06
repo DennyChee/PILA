@@ -59,7 +59,7 @@ class Sun69():
         signature parity with Mogi and for a future pressure parameterization).
     """
 
-    def __init__(self, x, y, nu=0.25):
+    def __init__(self, x, y, nu=0.25, dz_topo_m=None):
         super(Sun69, self).__init__()
         """
         Initialize the Sun (1969) penny-shaped crack model.
@@ -68,10 +68,14 @@ class Sun69():
             x (Tensor): East-coordinate of observation points (m), 1D tensor
             y (Tensor): North-coordinate of observation points (m), 1D tensor
             nu (float): Poisson's ratio for the medium (default 0.25)
+            dz_topo_m (Tensor or None): per-station topographic depth offset
+                (h_i - h_ref) in metres, 1D tensor like x. None = flat surface.
+                Note H/A validity then varies per station (no check, see caveats).
         """
         self.x = x
         self.y = y
         self.nu = nu
+        self.dz_topo_m = dz_topo_m
 
     def cart2pol(self, x, y):
         """
@@ -132,6 +136,9 @@ class Sun69():
 
         # --- Broadcast source scalars to [batch, 1] for elementwise math ---
         h = depth.unsqueeze(1)    # depth H (m)
+        # Williams & Wadge (1998) varying-depth topography: H_i = depth + (h_i - h_ref).
+        if self.dz_topo_m is not None:
+            h = h + self.dz_topo_m.to(h.device)   # [batch, N]
         a = radius.unsqueeze(1)   # radius A (m)
 
         # --- Maximum crack opening B = 3V / (2*pi*A^2)  (Sun 1969 eq 9/10a) ---

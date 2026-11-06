@@ -1,0 +1,77 @@
+#!/bin/bash
+# Usage:       qsub jobs/submit_mintpy_ta69_redundant.pbs
+# Description: Re-run MintPy for the real Marapi (W. Sumatra) Sentinel-1 ascending track 69
+#              stack with a REDUNDANT interferogram network, into a NEW directory
+#              mintpy_redundant/ (the original mintpy/ is only read, never modified).
+#              The original run kept 57/275 interferograms (coherence-based selection with
+#              minCoherence 0.6 rejected every pair -> minimum spanning tree), so temporal
+#              coherence was trivially 1 and unwrapping errors could not be corrected.
+# Changes vs the original smallbaselineApp.cfg (all other settings unchanged):
+#   mintpy.network.coherenceBased      yes/0.6 -> no      (keep all 275 pairs, 5 conn./date)
+#   mintpy.unwrapError.method          auto(no) -> phase_closure
+#   mintpy.networkInversion.minTempCoh auto      -> 0.7   (explicit; now meaningful)
+#   mintpy.reference.yx                auto      -> 360,394 (same reference pixel as original)
+#   mintpy.save.hdfEos5                yes       -> no
+#   water-mask paths                   -> copy inside mintpy_redundant/
+# Inputs copied (not re-loaded): inputs/ifgramStack.h5, geometryRadar.h5, ERA5.h5 (no ERA5
+#   re-download), SET.h5, waterMask.h5 (~4.2 GB). The stack's dropIfgram flags are reset first.
+# Environment: MintPy 1.6.1 in the base conda env (/eos-rs/miniconda3), as the original run.
+# Date:        2026-10-05
+#PBS -N mintpy_ta69_red
+#PBS -P eos_btaisne
+#PBS -q qintel_wfly
+#PBS -l nodes=1:ppn=8
+#PBS -l walltime=12:00:00
+#PBS -l mem=32gb
+#PBS -j oe
+#PBS -o /eos-rs/INSAR_processing/denny/PILA/logs/mintpy_ta69_redundant_pbs.log
+
+set -e
+
+# --- Named paths ---
+STACK_DIR="/eos-rs/INSAR_processing/denny/Marapi/S1_TA69"
+OLD_DIR="$STACK_DIR/mintpy"
+NEW_DIR="$STACK_DIR/mintpy_redundant"
+CFG="$NEW_DIR/smallbaselineApp.cfg"
+
+# --- Environment: base conda env has MintPy 1.6.1 ---
+source /eos-rs/miniconda3/etc/profile.d/conda.sh
+conda activate base
+export OMP_NUM_THREADS=8
+echo "[mintpy_ta69_red] Host: $(hostname)  Env: $CONDA_DEFAULT_ENV  Start: $(date)"
+python -c "import mintpy; print('[mintpy_ta69_red] MintPy', mintpy.__version__)"
+
+# --- Safety: never overwrite an existing redundant run ---
+if [ -e "$NEW_DIR" ]; then
+  echo "ERROR: $NEW_DIR already exists; refusing to overwrite" >&2
+  exit 1
+fi
+
+echo "[1/4] Creating $NEW_DIR and copying inputs (original mintpy/ untouched)..."
+mkdir -p "$NEW_DIR/inputs"
+cp "$OLD_DIR/inputs/ifgramStack.h5" "$OLD_DIR/inputs/geometryRadar.h5" \
+   "$OLD_DIR/inputs/ERA5.h5" "$OLD_DIR/inputs/SET.h5" "$NEW_DIR/inputs/"
+cp "$OLD_DIR/waterMask.h5" "$NEW_DIR/"
+cp "$OLD_DIR/smallbaselineApp.cfg" "$CFG"
+
+echo "[2/4] Editing the COPIED config..."
+sed -i \
+  -e "s|^mintpy.network.coherenceBased .*|mintpy.network.coherenceBased  = no  # was yes/0.6 -> collapsed to 57-pair spanning tree|" \
+  -e "s|^mintpy.unwrapError.method .*|mintpy.unwrapError.method          = phase_closure  # redundant network enables closure check|" \
+  -e "s|^mintpy.networkInversion.minTempCoh .*|mintpy.networkInversion.minTempCoh  = 0.7  # explicit; meaningful with redundancy|" \
+  -e "s|^mintpy.reference.yx .*|mintpy.reference.yx            = 360,394   # same reference pixel as original run|" \
+  -e "s|^mintpy.save.hdfEos5 .*|mintpy.save.hdfEos5         = no|" \
+  -e "s|$OLD_DIR/waterMask.h5|$NEW_DIR/waterMask.h5|g" \
+  "$CFG"
+grep -nE "^mintpy\.(network\.coherenceBased|unwrapError\.method|networkInversion\.minTempCoh|reference\.yx|save\.hdfEos5) |waterMask" "$CFG"
+
+echo "[3/4] Resetting dropIfgram flags in the copied stack..."
+cd "$NEW_DIR"
+modify_network.py inputs/ifgramStack.h5 --reset
+
+echo "[4/4] smallbaselineApp from modify_network onward..."
+smallbaselineApp.py "$CFG" --dir "$NEW_DIR" --start modify_network
+
+echo "[mintpy_ta69_red] Kept interferograms:"
+python -c "import h5py; f=h5py.File('inputs/ifgramStack.h5','r'); print(int(f['dropIfgram'][:].sum()), 'of', len(f['dropIfgram']))"
+echo "[mintpy_ta69_red] Finished: $(date). Output in $NEW_DIR"

@@ -30,11 +30,16 @@ class OkadaDike():
     nu : float                Poisson's ratio (default 0.25)
     """
 
-    def __init__(self, x, y, nu=0.25):
+    def __init__(self, x, y, nu=0.25, dz_topo_m=None):
         super(OkadaDike, self).__init__()
         self.x = x      # East station coords [N_stations], m
         self.y = y      # North station coords [N_stations], m
         self.nu = nu    # Poisson's ratio
+        # Williams & Wadge (1998) varying-depth topography: per-station offset
+        # (h_i - h_ref) [N_stations], m, added to the centroid depth so the whole
+        # fault sits deeper below high stations (as iokada_agung_residuals.m).
+        # None = flat surface (exact original code path).
+        self.dz_topo_m = dz_topo_m
 
     # ------------------------------------------------------------------
     # Tensile (opening) per-corner kernel  -- Okada (1985) eq. (7), z = 0
@@ -149,7 +154,10 @@ class OkadaDike():
         n1 = self.y.unsqueeze(0) - yoff.unsqueeze(1)
 
         # okadaMod.m front-end: centroid-referenced (E,N,depth) -> Okada (x,y,d)
-        d = depth.unsqueeze(1) + sin_d * W / 2.0          # deeper-edge depth
+        depth_eff = depth.unsqueeze(1)                     # centroid depth [batch,1]
+        if self.dz_topo_m is not None:
+            depth_eff = depth_eff + self.dz_topo_m.to(depth_eff.device)   # per-station [batch,N]
+        d = depth_eff + sin_d * W / 2.0                    # deeper-edge depth
         ec = e1 + cos_s * cos_d * W / 2.0
         nc = n1 - sin_s * cos_d * W / 2.0
         x = cos_s * nc + sin_s * ec + L / 2.0

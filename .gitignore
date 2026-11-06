@@ -162,6 +162,7 @@ classical_rerun/
 comparison_out/
 comparison_out_*/
 exported_ml*/
+exported_comsol/
 experiment_figures/
 pila_pres_figures/
 snr_figures_export/
