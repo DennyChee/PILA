@@ -32,9 +32,11 @@ HALF_WAVELENGTH_MM = 0.0555 / 2 * 1e3          # 27.75 mm: one 2*pi phase cycle 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--windows', required=True, help='dir with windows.json')
+    parser.add_argument('--geo-dir', default=GEO_DIR,
+                        help='MintPy geo/ dir (e.g. .../S1_TA69/mintpy_redundant/geo)')
     args = parser.parse_args()
     win_json = os.path.join(args.windows, 'windows.json')
-    for path in [win_json, os.path.join(GEO_DIR, TS_FILE)]:
+    for path in [win_json, os.path.join(args.geo_dir, TS_FILE)]:
         if not os.path.exists(path):
             raise FileNotFoundError(path)
     with open(win_json) as f:
@@ -42,19 +44,19 @@ def main():
     factor = win_cfg['multilook']
 
     print("[1/4] Reading coherence, height, velocity, mask (full resolution)...")
-    with h5py.File(os.path.join(GEO_DIR, 'geo_temporalCoherence.h5'), 'r') as f:
+    with h5py.File(os.path.join(args.geo_dir, 'geo_temporalCoherence.h5'), 'r') as f:
         tcoh = f['temporalCoherence'][:]
-    with h5py.File(os.path.join(GEO_DIR, 'geo_avgSpatialCoh.h5'), 'r') as f:
+    with h5py.File(os.path.join(args.geo_dir, 'geo_avgSpatialCoh.h5'), 'r') as f:
         scoh = f['coherence'][:]
-    with h5py.File(os.path.join(GEO_DIR, 'geo_geometryRadar.h5'), 'r') as f:
+    with h5py.File(os.path.join(args.geo_dir, 'geo_geometryRadar.h5'), 'r') as f:
         height_m = f['height'][:]
-    with h5py.File(os.path.join(GEO_DIR, 'geo_velocity.h5'), 'r') as f:
+    with h5py.File(os.path.join(args.geo_dir, 'geo_velocity.h5'), 'r') as f:
         vel_mm_yr = f['velocity'][:] * 1e3
-    with h5py.File(os.path.join(GEO_DIR, 'geo_maskTempCoh.h5'), 'r') as f:
+    with h5py.File(os.path.join(args.geo_dir, 'geo_maskTempCoh.h5'), 'r') as f:
         mask = f['mask'][:].astype(bool)
     print(f"  Loaded: shape={tcoh.shape}, dtype={tcoh.dtype}; mask valid {mask.mean():.1%}")
 
-    with h5py.File(os.path.join(GEO_DIR, TS_FILE), 'r') as f:
+    with h5py.File(os.path.join(args.geo_dir, TS_FILE), 'r') as f:
         dates = [d.decode() for d in f['date'][:]]
     years = np.array([(np.datetime64(f'{d[:4]}-{d[4:6]}-{d[6:]}') - np.datetime64(f'{dates[0][:4]}-{dates[0][4:6]}-{dates[0][6:]}'))
                       .astype(int) / 365.25 for d in dates])
@@ -66,7 +68,7 @@ def main():
         c0, c1 = win['cols'][0] * factor, win['cols'][1] * factor
         print(f"[2/4] Window W{w_idx}: full-res rows {r0}-{r1}, cols {c0}-{c1}")
         m = mask[r0:r1, c0:c1]
-        with h5py.File(os.path.join(GEO_DIR, TS_FILE), 'r') as f:
+        with h5py.File(os.path.join(args.geo_dir, TS_FILE), 'r') as f:
             ts_mm = f['timeseries'][:, r0:r1, c0:c1].astype(np.float32) * 1e3        # [T, h, w] window only
         ts_v = ts_mm[:, m]                                                           # [T, n_valid]
         ts_v = ts_v - np.median(ts_v, axis=1, keepdims=True)                         # per-epoch window reference

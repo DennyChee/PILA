@@ -62,6 +62,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--noisy-data', required=True, help='Stage-1 noisy data dir (for sigma_ref, scaler)')
     parser.add_argument('--out', required=True)
+    parser.add_argument('--geo-dir', default=TA69_GEO_DIR,
+                        help='MintPy geo/ dir (e.g. .../S1_TA69/mintpy_redundant/geo)')
     parser.add_argument('--min-dist-km', type=float, default=15.0,
                         help='min distance from ANY window pixel to a listed volcano (km)')
     parser.add_argument('--min-valid-frac', type=float, default=0.8)
@@ -69,9 +71,9 @@ def main():
     parser.add_argument('--seed', type=int, default=0)
     args = parser.parse_args()
 
-    ts_path = os.path.join(TA69_GEO_DIR, TS_FILE)
-    for path in [ts_path, os.path.join(TA69_GEO_DIR, 'geo_maskTempCoh.h5'),
-                 os.path.join(TA69_GEO_DIR, 'geo_velocity.h5')]:
+    ts_path = os.path.join(args.geo_dir, TS_FILE)
+    for path in [ts_path, os.path.join(args.geo_dir, 'geo_maskTempCoh.h5'),
+                 os.path.join(args.geo_dir, 'geo_velocity.h5')]:
         if not os.path.exists(path):
             raise FileNotFoundError(path)
     if os.path.exists(os.path.join(args.out, 'windows.npz')):
@@ -81,9 +83,9 @@ def main():
     rng = np.random.default_rng(args.seed)
 
     print("[1/5] Multilooking mask and velocity x4...")
-    with h5py.File(os.path.join(TA69_GEO_DIR, 'geo_maskTempCoh.h5'), 'r') as f:
+    with h5py.File(os.path.join(args.geo_dir, 'geo_maskTempCoh.h5'), 'r') as f:
         mask_full = f['mask'][:].astype(bool)
-    with h5py.File(os.path.join(TA69_GEO_DIR, 'geo_velocity.h5'), 'r') as f:
+    with h5py.File(os.path.join(args.geo_dir, 'geo_velocity.h5'), 'r') as f:
         vel_full_m_yr = f['velocity'][:]
     vel_ml, mask_ml = mask_aware_multilook(vel_full_m_yr[None] * 1e3, mask_full, MULTILOOK)   # mm/yr
     vel_ml, mask_ml = vel_ml[0], mask_ml & np.isfinite(vel_ml[0])
