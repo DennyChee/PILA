@@ -1,0 +1,1 @@
+from .trainer_phys_smpl import *

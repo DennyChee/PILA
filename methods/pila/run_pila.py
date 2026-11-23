@@ -1,0 +1,480 @@
+#!/usr/bin/env python
+# Usage:       python methods/pila/run_pila.py -c <config.json> [-r <checkpoint.pth>] [--seed N] [...]
+# Description: The ONE PILA training entry point (replaces train_pila.py and the train_pila_* launchers; the legacy
+#              scripts are kept unchanged at the repo root). Optional behaviours are config keys, see
+#              pila/extensions/__init__.py:
+#                trainer.extensions.delayed_penalty       penalty schedule (settings: trainer.phys_vae.delayed_penalty)
+#                trainer.extensions.log_per_epoch_sources per_epoch_sources.csv only
+#                trainer.extensions.keep_lowest           lowest_loss/ checkpoint + fit dump
+#                trainer.extensions.basin_hop             basin hopping (settings: trainer.phys_vae.basin_hop)
+#                arch.phys_vae.init_sources_mode          "explicit" (default) | "bias_only"
+#              A settings block without its switch is IGNORED (warning), as legacy train_pila.py ignored it.
+#              Config paths may use ${NAME} tokens from paths.yaml (see paths.example.yaml).
+#              Numerically identical to the legacy launchers (tests/regression/compare_with_legacy.py).
+# Date:        2026-11-23
+import argparse
+import collections
+import json
+import os
+import resource
+import subprocess
+import sys
+import time
+import torch
+import numpy as np
+
+# Repo root on sys.path so 'pila' imports when this file is run directly (python methods/pila/run_pila.py ...)
+METHOD_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(os.path.dirname(METHOD_DIR))
+sys.path.insert(0, REPO_ROOT)
+
+import pila.data_loader.data_loaders as module_data  # noqa: E402
+import pila.model.loss as module_loss  # noqa: E402
+import pila.model.metric as module_metric  # noqa: E402
+from pila.model import PHYS_VAE_SMPL  # noqa: E402  PILA model
+from pila.parse_config import ConfigParser  # noqa: E402
+from pila.trainer import PhysVAETrainerSMPL  # noqa: E402  PILA trainer
+from pila.utils import prepare_device  # noqa: E402
+from pila.extensions import install_extensions, finish_basin_hop  # noqa: E402
+import wandb  # noqa: E402
+
+# Fix random seeds for reproducibility. SEED is the historical default (123); it can be
+# overridden per run via the config key "seed" or the CLI flag --seed (see main()), which
+# is how multi-start ensembles escape null-source local minima on noisy real scenes.
+SEED = 123
+
+
+def set_seed(seed):
+    """Set torch + numpy RNG seeds (deterministic cuDNN) for a reproducible run."""
+    torch.manual_seed(int(seed))
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    np.random.seed(int(seed))
+
+
+set_seed(SEED)  # default; main() re-seeds from config['seed'] if provided
+
+
+def log_compute_usage(config, logger, data_loader, model, device, data_load_sec, train_sec,
+                      timing_summary=None, warm_start_info=None):
+    """
+    Record compute/scalability stats for the run and write them to compute_usage.json.
+
+    Captures the problem size (observation points/grid cells, time-series samples), the
+    MintPy load+multilook time, the training time and throughput, and peak memory — so
+    runs of different scene sizes / multilook factors can be compared for scalability.
+    """
+    args = config['arch']['args']
+    n_train_epochs = config['trainer']['epochs']
+    n_samples = len(data_loader.dataset)
+    usage = {
+        'device': str(device),
+        'physics': args.get('physics'),
+        'encoder_type': args.get('encoder_type', 'mlp'),
+        'n_obs_points': args.get('input_dim'),     # LOS cells (MLP) or grid cells (CNN)
+        'n_samples_epochs': n_samples,             # time-series epochs used as samples
+        'n_train_epochs': n_train_epochs,
+        'batch_size': config['data_loader']['args'].get('batch_size'),
+        'model_params': int(sum(p.numel() for p in model.parameters())),
+        'data_load_sec': round(data_load_sec, 2),  # MintPy read + multilook (+model build)
+        'train_sec': round(train_sec, 2),
+        'sec_per_train_epoch': round(train_sec / max(n_train_epochs, 1), 3),
+        'samples_per_sec': round(n_samples * n_train_epochs / max(train_sec, 1e-9), 1),
+        'peak_rss_mb': round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 1),
+        'gpu_peak_mb': round(torch.cuda.max_memory_allocated() / 1e6, 1) if torch.cuda.is_available() else 0.0,
+        'n_sources': int(args.get('n_sources', 1)),
+        'dim_z_phy': config['arch']['phys_vae']['dim_z_phy'],
+        'seed': config.config.get('seed') if hasattr(config, 'config') else None,
+    }
+    # Sequential multi-source warm start (K-1 -> K) cost and where the new source started.
+    if warm_start_info is not None:
+        usage['warm_start_sec'] = round(warm_start_info['warm_start_sec'], 3)
+        usage['warm_start_from'] = warm_start_info['init_from']
+        usage['warm_start_new_source'] = warm_start_info['new_source_start']
+    # Per-phase training wall-clock (utils/timing.PhaseTimer): seconds, fractions, ms per call and
+    # per sample, so e.g. physics_decode cost can be compared across K = 1, 2, 3 sources.
+    if timing_summary:
+        usage['timing'] = timing_summary
+    # InSAR multilook geometry (memoized loader -> instant) for the scene/grid context.
+    ins = args.get('insar')
+    if ins is not None:
+        try:
+            from pila.datasets.preprocessing.insar_mintpy import load_insar_mintpy
+            d = load_insar_mintpy(
+                ins['timeseries'], ins['geometry'], ins.get('mask'),
+                ins['lat0'], ins['lon0'], multilook=ins.get('multilook', 20),
+                coh_valid_frac=ins.get('coh_valid_frac', 0.5), bbox=ins.get('bbox'),
+                ref_date=ins.get('ref_date'), verbose=False)
+            usage.update({'multilook': ins.get('multilook', 20),
+                          'coarse_grid': list(d.mask_d.shape),
+                          'coherent_cells': int(d.mask_d.sum()),
+                          'bbox': ins.get('bbox')})
+        except Exception as exc:  # telemetry must never crash training
+            logger.warning(f"compute-usage: could not read InSAR geometry: {exc}")
+
+    out_path = os.path.join(str(config.save_dir), 'compute_usage.json')
+    with open(out_path, 'w') as f:
+        json.dump(usage, f, indent=2)
+    logger.info("=== Compute usage (scalability) ===")
+    for key, val in usage.items():
+        logger.info(f"  {key}: {val}")
+    logger.info(f"  written to {out_path}")
+
+
+def generate_insar_figures(config, logger):
+    """
+    End-of-run verification figures for InSAR inversions: observed LOS, model fit,
+    and residual maps + a 1:1 scatter, for visual inspection.
+
+    Delegates to methods/pila/plot_insar_results.py (the tested MLP/point LOS
+    plotting path) as an isolated subprocess so a plotting failure can never fail
+    an otherwise-completed training run. Only applies to the h5-native InSAR LOS
+    MLP path (physics '*_LOS', encoder_type != 'cnn', with an 'insar' block); the
+    CNN/image path is skipped (different I/O) and GPS configs have no insar field.
+    """
+    args = config['arch']['args']
+    physics = args.get('physics', '')
+    encoder_type = args.get('encoder_type', 'mlp')
+    if not (physics.endswith('_LOS') and encoder_type != 'cnn' and 'insar' in args):
+        logger.info(f"Skipping auto figures (physics={physics}, encoder_type={encoder_type}): "
+                    f"plot_insar_results.py only supports the InSAR LOS MLP path.")
+        return
+
+    # config.save_dir is the run's models/ dir; model_best.pth is written there.
+    resume_path = os.path.join(str(config.save_dir), 'model_best.pth')
+    if not os.path.exists(resume_path):
+        logger.warning(f"Auto figures: model_best.pth not found at {resume_path}; skipping.")
+        return
+
+    # K-source Mogi: plot_insar_results.py assumes one 4-parameter source, so instead dump the
+    # per-acquisition, per-source fit (fit_K<k>.npz + infer_usage_K<k>.json) used by the
+    # sequential source-count selection. Isolated subprocess, never fails the training run.
+    if physics == 'MultiMogi_LOS':
+        dump_script = os.path.join(METHOD_DIR, 'dump_fit.py')
+        cmd = [sys.executable, dump_script, '--resume', resume_path]
+        logger.info(f"Dumping per-source fit: {' '.join(cmd)}")
+        try:
+            subprocess.run(cmd, check=True, cwd=REPO_ROOT)
+        except (subprocess.CalledProcessError, OSError) as exc:
+            logger.warning(f"Per-source dump failed ({exc}); run {' '.join(cmd)} manually.")
+        return
+
+    script = os.path.join(METHOD_DIR, 'plot_insar_results.py')
+    cmd = [sys.executable, script, '--resume', resume_path]
+    logger.info(f"Generating verification figures: {' '.join(cmd)}")
+    try:
+        # Plotting must never crash a finished run; capture and log on failure only.
+        subprocess.run(cmd, check=True, cwd=REPO_ROOT)
+        figures_dir = os.path.join(os.path.dirname(str(config.save_dir)), 'figures')
+        logger.info(f"Verification figures written to {figures_dir}")
+    except subprocess.CalledProcessError as exc:
+        logger.warning(f"Auto figure generation failed (exit {exc.returncode}); "
+                       f"run plot_insar_results.py -r {resume_path} manually.")
+
+
+def _propagate_insar_uq(cfg):
+    """
+    Mirror the UQ/decimation keys (multilook, stride, offset) from the canonical
+    arch.args.insar block into every OTHER insar block in the config (the data_loader
+    train block and the valid/test data_dir blocks). PILA derives points from each block
+    independently via the memoized loader, so all blocks MUST carry identical
+    multilook/stride/offset or the dataset and decoder would invert different subsets.
+
+    Mutates `cfg` (a plain dict) in place. No-op when there is no arch.args.insar block
+    (e.g. GNSS runs) or when none of the keys are set.
+    """
+    arch_ins = cfg.get('arch', {}).get('args', {}).get('insar')
+    if not arch_ins:
+        return
+    # ref_date MUST propagate too: if the canonical block re-references to a chosen
+    # epoch but the train/valid/test blocks don't, the dataset and decoder would
+    # invert different temporal baselines for the same nominal epoch.
+    uq_keys = {k: arch_ins[k] for k in
+               ('multilook', 'stride', 'offset', 'ref_date',
+                'bootstrap_k', 'bootstrap_block', 'bootstrap_seed') if k in arch_ins}
+    if not uq_keys:
+        return
+    dl = cfg.get('data_loader', {})
+    # Two block shapes exist: data_loader.args wraps the insar dict under an 'insar' key,
+    # whereas data_dir_valid / data_dir_test ARE the insar dict directly (they hold
+    # 'timeseries'/'geometry' at top level and are passed as the loader's `insar` arg).
+    candidates = [dl.get('args', {}), dl.get('data_dir_valid', {}), dl.get('data_dir_test', {})]
+    for block in candidates:
+        if not isinstance(block, dict):
+            continue
+        if isinstance(block.get('insar'), dict):       # wrapped: ...args.insar
+            block['insar'].update(uq_keys)
+        elif 'timeseries' in block:                    # bare insar dict (valid/test)
+            block.update(uq_keys)
+
+
+def _check_insar_scene_paths(cfg):
+    """
+    Hard-fail if the decoder's scene (arch.args.insar.timeseries) is not the training scene
+    (data_loader.args.insar.timeseries). The decoder standardizes its output with the mean/std
+    of ITS scene, so a mismatch silently rescales every predicted amplitude (the 2026-09-07
+    vbICA campaign ran 11 cubes against marapi_mogi_rising_combined's 141 mm std this way).
+    No-op when either block is absent (GNSS / legacy JSON runs).
+    """
+    arch_ins = cfg.get('arch', {}).get('args', {}).get('insar')
+    train_ins = cfg.get('data_loader', {}).get('args', {}).get('insar')
+    if not isinstance(arch_ins, dict) or not isinstance(train_ins, dict):
+        return
+    project_dir = REPO_ROOT
+    resolve = lambda path: os.path.realpath(os.path.join(project_dir, path))   # abs paths pass through
+    if resolve(arch_ins['timeseries']) != resolve(train_ins['timeseries']):
+        raise ValueError("arch.args.insar.timeseries != data_loader.args.insar.timeseries:\n"
+                         f"  decoder: {arch_ins['timeseries']}\n  data:    {train_ins['timeseries']}\n"
+                         "The decoder would standardize with the wrong scene's mean/std.")
+
+
+def main(config):
+    logger = config.get_logger('train')
+
+    # Re-seed from the config (set via --seed / config key "seed"); default = SEED (123).
+    # The module-level set_seed(SEED) above ran at import with the default; this lets a
+    # multi-start ensemble vary the RNG init per run to escape null-source local minima.
+    run_seed = config.config.get('seed', SEED)
+    set_seed(run_seed)
+    logger.info(f"RNG seed = {run_seed}")
+
+    # Keep all insar blocks consistent before any loader/model reads them (UQ decimation).
+    _propagate_insar_uq(config.config)
+    _check_insar_scene_paths(config.config)
+    ins_dbg = config.config.get('arch', {}).get('args', {}).get('insar', {})
+    print(f"  InSAR UQ config: multilook={ins_dbg.get('multilook', 1)}, "
+          f"stride={ins_dbg.get('stride', 1)}, offset={ins_dbg.get('offset', 0)}")
+
+    # Setup data_loader instances (time the MintPy read + multilook for h5 datasets)
+    t_data0 = time.time()
+    data_loader = config.init_obj('data_loader', module_data)
+
+    valid_data_loader = getattr(module_data, config['data_loader']['type'])(
+        config['data_loader']['data_dir_valid'],
+        batch_size=64,
+        shuffle=True,
+        validation_split=0.0,
+        num_workers=2,
+        with_const=config['data_loader']['args']['with_const'] if 'with_const' in config['data_loader']['args'] else False
+    )
+
+    data_load_sec = time.time() - t_data0
+
+    # Build model architecture and log
+    model = PHYS_VAE_SMPL(config)
+    logger.info(model)
+
+    # Sequential multi-source: warm-start a K-source MultiMogi model from the (K-1) fit.
+    warm_start_info = None
+    if config['arch']['phys_vae'].get('init_from'):
+        from pila.utils.warm_start import warm_start_multimogi
+        warm_start_info = warm_start_multimogi(model, config, data_loader, logger)
+    elif config['arch']['phys_vae'].get('init_sources'):
+        # Explicit start for a fresh K-source network (init test): sources at the given (x, y, d, dV).
+        # init_sources_mode: "explicit" (zeroed compass + tight variance) or "bias_only" (bias only, weights random)
+        init_mode = config['arch']['phys_vae'].get('init_sources_mode', 'explicit')
+        if init_mode == 'explicit':
+            from pila.utils.warm_start import warm_start_explicit_sources
+        elif init_mode == 'bias_only':
+            from pila.extensions.init_bias_only import warm_start_bias_only as warm_start_explicit_sources
+        else:
+            raise ValueError(f"arch.phys_vae.init_sources_mode must be 'explicit' or 'bias_only', got {init_mode!r}")
+        warm_start_info = warm_start_explicit_sources(model, config, logger)
+    elif config['arch']['phys_vae'].get('seed_init'):
+        # Opt-in K=1 start (depth / residual-peak seeding); absent in the standard recipe.
+        from pila.utils.warm_start import seed_first_source
+        seed_first_source(model, config, data_loader, logger)
+
+    # Prepare for (multi-device) GPU training
+    device, device_ids = prepare_device(config['n_gpu'])
+    model = model.to(device)
+    if len(device_ids) > 1:
+        model = torch.nn.DataParallel(model, device_ids=device_ids)
+
+    # Get function handles for loss and metrics
+    criterion = getattr(module_loss, config['loss'])
+    metrics = [getattr(module_metric, met) for met in config['metrics']]
+
+    # Build optimizer and learning rate scheduler
+    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
+    optimizer = config.init_obj('optimizer', torch.optim, trainable_params)
+
+    # CHANGED: make scheduler optional
+    lr_scheduler = None
+    if 'lr_scheduler' in config.config:
+        lr_scheduler = config.init_obj('lr_scheduler', torch.optim.lr_scheduler, optimizer)
+
+    # Initialize Phys-VAE Trainer
+    trainer = PhysVAETrainerSMPL(
+        model, criterion, metrics, optimizer,
+        config=config,
+        device=device,
+        data_loader=data_loader,
+        valid_data_loader=valid_data_loader,
+        lr_scheduler=lr_scheduler
+    )
+
+    # Optional extensions (delayed penalty / source log / keep-lowest / basin hop), from config keys.
+    active_extensions = install_extensions(trainer, config)
+    logger.info(f"Extensions: {active_extensions}")
+
+    t_train0 = time.time()
+    trainer.train()
+    train_sec = time.time() - t_train0
+
+    # Record compute/scalability usage for this run.
+    timing_summary = trainer.timer.summary(n_samples_seen=trainer.n_samples_seen) if trainer.timer.enabled else None
+    log_compute_usage(config, logger, data_loader, model, device, data_load_sec, train_sec,
+                      timing_summary=timing_summary, warm_start_info=warm_start_info)
+
+    # Generate observed / model-fit / residual figures for visual inspection.
+    generate_insar_figures(config, logger)
+
+    # Extension post-processing (as the legacy keep-best / basin-hop launchers did after training).
+    if active_extensions['basin_hop']:
+        finish_basin_hop(trainer)
+    if active_extensions['keep_lowest']:
+        dump_extra_checkpoints(config, active_extensions)
+
+
+def dump_extra_checkpoints(config, active_extensions):
+    """
+    Dump lowest_loss/ (and basin_best/) checkpoints to fit_K<k>.npz with methods/pila/dump_fit.py, exactly as the
+    legacy launchers did. Unlike the auto figures, a failure here is an error: these fits ARE the run's result.
+    """
+    models_dir = str(config.save_dir)
+    targets = [('lowest_loss', 'model_lowest_loss.pth')]
+    if active_extensions['basin_hop']:
+        targets.append(('basin_best', 'model_basin_best.pth'))
+    n_sources = int(config['arch']['args'].get('n_sources', 1))
+    for out_dir, checkpoint_name in targets:
+        checkpoint = os.path.join(models_dir, out_dir, checkpoint_name)
+        if not os.path.exists(checkpoint):
+            raise RuntimeError(f"{checkpoint} was not written")
+        out_npz = os.path.join(models_dir, out_dir, f'fit_K{n_sources}.npz')
+        print(f"[extensions] Dumping {checkpoint} -> {out_npz}")
+        subprocess.run([sys.executable, os.path.join(METHOD_DIR, 'dump_fit.py'), '--resume', checkpoint,
+                        '--out', out_npz], check=True, cwd=REPO_ROOT)
+
+
+if __name__ == '__main__':
+    args = argparse.ArgumentParser(description='PILA training')
+    args.add_argument('-c', '--config', default=None, type=str,
+                      help='config file path (default: None)')
+    args.add_argument('-r', '--resume', default=None, type=str,
+                      help='path to latest checkpoint (default: None)')
+    args.add_argument('-d', '--device', default=None, type=str,
+                      help='indices of GPUs to enable (default: all)')
+
+    CustomArgs = collections.namedtuple('CustomArgs', 'flags type target')
+    options = [
+        CustomArgs(['--lr', '--learning_rate'],
+                   type=float, target='optimizer;args;lr'),
+        CustomArgs(['--bs', '--batch_size'], type=int,
+                   target='data_loader;args;batch_size'),
+        # PhysVAE specific arguments TODO a more elegant way to do this, currently it is hardcoded in parse_config.py
+        CustomArgs(['--use_kl_term_z_phy'], type=str,
+                   target='trainer;phys_vae;use_kl_term_z_phy'),
+        CustomArgs(['--beta_max_z_phy'], type=float,
+                   target='trainer;phys_vae;beta_max_z_phy'),
+        CustomArgs(['--use_kl_term_z_aux'], type=str,
+                   target='trainer;phys_vae;use_kl_term_z_aux'),
+        CustomArgs(['--beta_max_z_aux'], type=float,
+                   target='trainer;phys_vae;beta_max_z_aux'),
+        CustomArgs(['--kl_warmup_epochs'], type=int,
+                   target='trainer;phys_vae;kl_warmup_epochs'),
+        CustomArgs(['--epochs_pretrain'], type=int,
+                   target='trainer;phys_vae;epochs_pretrain'),
+        CustomArgs(['--tau_warmup_epochs'], type=int,
+                   target='arch;phys_vae;tau_warmup_epochs'),
+        CustomArgs(['--tau_init'], type=float,
+                   target='arch;phys_vae;tau_init'),
+        CustomArgs(['--r_warmup_epochs'], type=int,
+                   target='arch;phys_vae;r_warmup_epochs'),
+        CustomArgs(['--r_init'], type=float,
+                   target='arch;phys_vae;r_init'),
+        CustomArgs(['--dim_z_aux'], type=int,
+                   target='arch;phys_vae;dim_z_aux'),
+        CustomArgs(['--residual_rank'], type=int,
+                   target='arch;phys_vae;residual_rank'),
+        CustomArgs(['--detach_x_P_for_bias'], type=str,
+                   target='arch;phys_vae;detach_x_P_for_bias'),
+        # NEW: Capacity control arguments
+        CustomArgs(['--use_capacity_control'], type=str,
+                   target='trainer;phys_vae;use_capacity_control'),
+        CustomArgs(['--C_max'], type=float,
+                   target='trainer;phys_vae;C_max'),
+        CustomArgs(['--C_gamma'], type=float,
+                   target='trainer;phys_vae;C_gamma'),
+        CustomArgs(['--beta_aux'], type=float,
+                   target='trainer;phys_vae;beta_aux'),
+        CustomArgs(['--coeff_penalty_weight'], type=float,
+            target='trainer;phys_vae;coeff_penalty_weight'),
+        CustomArgs(['--delta_penalty_weight'], type=float,
+            target='trainer;phys_vae;delta_penalty_weight'),
+        # NEW: Edge penalty arguments
+        CustomArgs(['--edge_penalty_weight'], type=float,
+                   target='trainer;phys_vae;edge_penalty_weight'),
+        CustomArgs(['--edge_penalty_power'], type=float,
+                   target='trainer;phys_vae;edge_penalty_power'),
+        # NEW: EMA prior arguments
+        CustomArgs(['--use_ema_prior'], type=str,
+                   target='trainer;phys_vae;use_ema_prior'),
+        CustomArgs(['--ema_momentum'], type=float,
+                   target='trainer;phys_vae;ema_momentum'),
+        # NEW: data_loader type
+        CustomArgs(['--data_loader_type'], type=str,
+                   target='data_loader;type'),
+        # NEW: Time feature arguments
+        CustomArgs(['--time_feat_dim'], type=int,
+                   target='arch;args;time_feat_dim'),
+        CustomArgs(['--use_time_in_residual'], type=str,
+                   target='arch;args;use_time_in_residual'),
+        CustomArgs(['--temporal_smoothness_weight'], type=float,
+                   target='trainer;phys_vae;temporal_smoothness_weight'),
+        CustomArgs(['--loss'], type=str,
+                   target='loss'),
+        # UQ strided-decimation ensemble: multilook (default 1 = full res), stride n, and
+        # this member's phase offset. These set the CANONICAL arch.args.insar block;
+        # _propagate_insar_uq() then mirrors them into the data_loader / valid / test
+        # insar blocks so every path inverts the SAME point subset.
+        CustomArgs(['--multilook'], type=int,
+                   target='arch;args;insar;multilook'),
+        CustomArgs(['--stride'], type=int,
+                   target='arch;args;insar;stride'),
+        CustomArgs(['--offset'], type=int,
+                   target='arch;args;insar;offset'),
+        # Multi-start: override the RNG seed (top-level config key) so the same scene can be
+        # re-fit from several inits; keep the best-reconstruction-loss run to escape
+        # null-source local minima on noisy real data.
+        CustomArgs(['--seed'], type=int, target='seed'),
+    ]
+    config = ConfigParser.from_args(args, options)
+    
+    # Debug: Print updated config values
+    print(f"Updated config values:")
+    print(f"  use_kl_term_z_phy: {config.config['trainer']['phys_vae'].get('use_kl_term_z_phy', 'NOT_SET')}")
+    print(f"  beta_max_z_phy: {config.config['trainer']['phys_vae'].get('beta_max_z_phy', 'NOT_SET')}")
+    print(f"  use_kl_term_z_aux: {config.config['trainer']['phys_vae'].get('use_kl_term_z_aux', 'NOT_SET')}")
+    print(f"  beta_max_z_aux: {config.config['trainer']['phys_vae'].get('beta_max_z_aux', 'NOT_SET')}")
+    print(f"  kl_warmup_epochs: {config.config['trainer']['phys_vae'].get('kl_warmup_epochs', 'NOT_SET')}")
+    print(f"  epochs_pretrain: {config.config['trainer']['phys_vae'].get('epochs_pretrain', 'NOT_SET')}")
+    print(f"  use_ema_prior: {config.config['trainer']['phys_vae'].get('use_ema_prior', 'NOT_SET')}")
+    print(f"  ema_momentum: {config.config['trainer']['phys_vae'].get('ema_momentum', 'NOT_SET')}")
+    print(f"  edge_penalty_weight: {config.config['trainer']['phys_vae'].get('edge_penalty_weight', 'NOT_SET')}")
+    print(f"  edge_penalty_power: {config.config['trainer']['phys_vae'].get('edge_penalty_power', 'NOT_SET')}")
+    print(f"  detach_x_P_for_bias: {config.config['arch']['phys_vae'].get('detach_x_P_for_bias', 'NOT_SET')}")
+
+    wandb.init(
+        project="PILA",
+        name=f"{config['name']}",
+        config=config,
+        mode="online" if config['trainer']['wandb'] else "disabled",
+    )
+
+    main(config)
+
+    wandb.finish()
+    print(f"Done. Output saved to {config.save_dir}")
+
+# NOTE: consider CosineAnnealingLR or ReduceLROnPlateau; see config.

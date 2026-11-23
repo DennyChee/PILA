@@ -1,0 +1,10 @@
+# Machine-specific data roots for PILA. Copy to paths.yaml (gitignored) and edit for your machine.
+# Configs refer to these as ${NAME}; an environment variable PILA_<NAME> overrides the value here.
+# Paths relative to the repository (configs/, synthetic/, scenarios/) need no token.
+
+# Root holding real MintPy stacks laid out as <Volcano>/S1_<track>/mintpy/geo/
+MINTPY_ROOT: /path/to/insar_processing
+
+# External method repositories (kept separate from PILA)
+VBICA_REPO: /path/to/vbICA                    # github.com/DennyChee/vbICA
+MCMC_REPO: /path/to/insar-classical-inversion  # github.com/DennyChee/insar-classical-inversion (iclassic_insar.m)
