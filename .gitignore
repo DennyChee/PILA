@@ -185,3 +185,7 @@ synthetic/snr_sweep_ml1/
 synthetic/snr_sweep_ml1_ff/
 synthetic/logs/
 synthetic/__pycache__/
+
+# --- 2026-11-23 clean restructure: legacy outputs + new run root ---
+saved_legacy_*/
+runs/
