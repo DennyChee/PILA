@@ -1,6 +1,6 @@
 # Plan — clean PILA repo + fresh 4-method comparison
 
-Date: 2026-11-23 · Status: APPROVED 2026-11-23 (Phase 0 in progress)
+Date: 2026-11-23 · Status: Phases 0-2 DONE 2026-11-23 (see docs/COMPARISON_PIPELINE.md); next = Phase 4 decisions
 
 Decisions already made (user, 2026-11-23):
 - Methods now: **PILA**, **per-epoch SA+MCMC** (MATLAB, `iclassic_insar.m`), **vbICA** (MATLAB).

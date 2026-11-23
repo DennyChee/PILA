@@ -1,12 +1,23 @@
-# vbICA (adapter — Phase 2)
+# vbICA (adapter)
 
-vbICA stays in its own repo (github.com/DennyChee/vbICA; local path = `${VBICA_REPO}`).
+vbICA stays in its own repo (`${VBICA_REPO}`). Nothing is written into it: `export.py` builds a self-contained
+working directory inside the run directory (vbICA resolves every path relative to `pwd`), with `Code/` symlinked.
 
-Adapter steps (decided 2026-11-23):
-1. export the scenario to the vbICA `.mat` layout (legacy: `vbICA/Code_denny/pila_bench/convert_pila_cube_to_vbica.py`);
-2. read `decomposedICA*.mat` back;
-3. GROUP the ICs that belong to one deforming source (a moving source spreads over several ICs) with an
-   honest, truth-free rule chosen in Phase 4; noise/APS ICs are left out by the same rule;
-4. rebuild each source's per-date signal (sum of its ICs: map x time course);
-5. invert every date of that signal with the same per-epoch SA+MCMC as `methods/mcmc`;
-6. write the common `params.npz`.
+```bash
+python -m methods.vbica.export --scenario-id <id> --out runs/vbica/<id>/<run_id>
+methods/vbica/run_vbica.sh runs/vbica/<id>/<run_id> <N> 1                  # decomposition + IC fields
+python -m methods.vbica.perepoch export --run runs/vbica/<id>/<run_id> --n-comp <N> --rule overlap_cluster --offset fit
+matlab -batch "addpath('methods/mcmc'); run_iclassic_perdate('runs/vbica/<id>/<run_id>/group_<g>', '<MCMC_REPO>')"   # each group
+python -m methods.vbica.perepoch import --run runs/vbica/<id>/<run_id>
+```
+Steps: (1) export (north-first rows, ascending axes, metres; orientation round trip asserted); (2) vbICA's own
+driver; (3) `export_ic_fields.m` rebuilds every IC field with vbICA's own `calc_displ_lincomp` (checked against
+`ICA.ts_comp`); (4) group ICs (`grouping.py`), sum each group, invert every date with the SAME per-epoch MCMC
+(K=1 per group, free offset, shared prior box); (5) import to the common output.
+
+Removed from the legacy route because they read the truth: IC choice by peak correlation with the clean field,
+the unit check against the truth RMS, and the truth gates in `export_ic_group.m`.
+
+OPEN for Phase 4 (must be automatic, truth-free, identical for every scenario): the IC-grouping rule
+(`overlap_cluster` is only a candidate) and the choice of N. Real data: vbICA reads MintPy through its own
+scenario setup (not yet wired into this adapter). Convergence (`max_steps`) is recorded per run.
