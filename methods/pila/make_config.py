@@ -58,6 +58,15 @@ def insar_block(row):
     return block
 
 
+def count_points(block):
+    """Number of valid points the PILA loader produces for an insar block (encoder input width)."""
+    from pila.datasets.preprocessing.insar_mintpy import load_insar_mintpy
+    stack = load_insar_mintpy(block['timeseries'], block['geometry'], block.get('mask'), block['lat0'], block['lon0'],
+                              multilook=block.get('multilook', 1), coh_valid_frac=block.get('coh_valid_frac', 0.5),
+                              bbox=block.get('bbox'), verbose=False, ref_date=block.get('ref_date'))
+    return int(stack.los_points_mm.shape[1])
+
+
 def make_config(row, model, n_sources, save_dir, overlays=(), seed=1, epochs=None, prior_file=None):
     """
     Build the config dict for one scenario row.
@@ -83,6 +92,9 @@ def make_config(row, model, n_sources, save_dir, overlays=(), seed=1, epochs=Non
     if config['arch']['args']['physics'] == 'MultiMogi_LOS':
         config['arch']['args']['n_sources'] = int(n_sources)
     config['arch']['phys_vae']['dim_z_phy'] = int(n_per_source * n_sources)
+    # input_dim = number of valid (coherent, unmasked) points PILA will see -- counted with PILA's own loader,
+    # so masked synthetic scenes and multilooked real scenes get the right encoder width (template value: 16384).
+    config['arch']['args']['input_dim'] = count_points(block)
     config['arch']['args']['insar'] = copy.deepcopy(block)
     config['data_loader']['args']['insar'] = copy.deepcopy(block)
     config['data_loader']['data_dir_valid'] = copy.deepcopy(block)

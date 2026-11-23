@@ -87,16 +87,28 @@ def match_slots(true_xy, fit_xy, active):
     return pairs
 
 
-def align_to_scenario(cube, recon_x, recon_y, scenario):
-    """Flip a recon cube [T, H, W] so its axes match the scenario's (x_m, y_m); error if grids differ."""
+def align_to_scenario(cube, recon_x, recon_y, scenario, tol_frac_pixel=0.01):
+    """
+    Flip a recon cube [T, H, W] so its axes match the scenario's (x_m, y_m); error if the grids differ.
+
+    Axes match if every coordinate agrees within tol_frac_pixel x the pixel spacing (absolute, so it also works
+    for coordinates near 0, where a relative tolerance would be ~0); a flip or a one-pixel shift always fails.
+    """
+    def same(a, b):
+        a, b = np.asarray(a, float), np.asarray(b, float)
+        if a.shape != b.shape:
+            return False
+        spacing = np.median(np.abs(np.diff(b))) if b.size > 1 else 1.0
+        return bool(np.max(np.abs(a - b)) <= tol_frac_pixel * spacing)
+
     out = cube
-    if not np.allclose(recon_y, scenario['y_m']):
-        if np.allclose(recon_y[::-1], scenario['y_m']):
+    if not same(recon_y, scenario['y_m']):
+        if same(recon_y[::-1], scenario['y_m']):
             out = out[:, ::-1, :]
         else:
             raise ValueError("recon y axis does not match the scenario grid")
-    if not np.allclose(recon_x, scenario['x_m']):
-        if np.allclose(recon_x[::-1], scenario['x_m']):
+    if not same(recon_x, scenario['x_m']):
+        if same(recon_x[::-1], scenario['x_m']):
             out = out[:, :, ::-1]
         else:
             raise ValueError("recon x axis does not match the scenario grid")
@@ -245,7 +257,11 @@ def recon_metrics(scenario, run_output, track):
     out = {}
 
     def demean(cube):
-        return cube - np.nanmean(cube[:, valid], axis=1)[:, None, None]
+        # per-date spatial mean over valid pixels; dates with no finite pixel (not run) stay NaN without a warning
+        values = cube[:, valid]
+        finite_count = np.sum(np.isfinite(values), axis=1)
+        means = np.where(finite_count > 0, np.nansum(values, axis=1) / np.maximum(finite_count, 1), np.nan)
+        return cube - means[:, None, None]
 
     if f'los_{track}_m' in recon:
         cube = align_to_scenario(recon[f'los_{track}_m'], recon['x_m'], recon['y_m'], scenario)

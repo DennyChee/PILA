@@ -41,6 +41,23 @@ def pixel_fingerprint(mask):
     return hashlib.sha1(mask.tobytes() + str(mask.shape).encode()).hexdigest()[:16]
 
 
+def grid_axes_m(east_km_grid, north_km_grid, mask):
+    """
+    1-D map axes (metres) of a regular loader grid, fitted from the VALID cells only.
+
+    The PILA loader zeroes the coordinates of masked cells, so a masked first row / column must not be read as an
+    axis. Inputs: east_km_grid, north_km_grid [H, W] (km, from the loader), mask [H, W] bool (True = valid).
+    Output: (x_m [W], y_m [H]) from least-squares lines x = a + b*col, y = c + d*row over the valid cells.
+    """
+    rows, cols = np.nonzero(np.asarray(mask, dtype=bool))
+    if rows.size < 2:
+        raise ValueError("need at least two valid cells to recover the grid axes")
+    x_fit = np.polyfit(cols, np.asarray(east_km_grid)[rows, cols] * 1e3, 1)
+    y_fit = np.polyfit(rows, np.asarray(north_km_grid)[rows, cols] * 1e3, 1)
+    n_rows, n_cols = np.asarray(mask).shape
+    return np.polyval(x_fit, np.arange(n_cols)), np.polyval(y_fit, np.arange(n_rows))
+
+
 def _json_safe(obj):
     """Replace NaN / inf floats by None (strict JSON) recursively."""
     if isinstance(obj, dict):

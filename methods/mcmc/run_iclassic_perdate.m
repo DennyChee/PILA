@@ -52,6 +52,20 @@ for t = date_indices(:)'
         continue
     end
     t0 = tic;
+    % A date whose LOS has zero variance (e.g. the reference date of a real stack, all pixels exactly 0) cannot be
+    % inverted: the original noise scale sig_L = std(LOS) would be 0. Record it as not invertible (NaN parameters,
+    % reason stored) instead of crashing; every method sees the same zero field.
+    obs = load(in_mat, 'los_obs_m');
+    if std(double(obs.los_obs_m(:)), 1) == 0
+        n_par = numel(iclassic_param_count(info.model)) * info.n_sources + logical(info.fit_offset);
+        R = struct('m_best', nan(1, n_par), 'post_lo', nan(1, n_par), 'post_med', nan(1, n_par), ...
+                   'post_hi', nan(1, n_par), 'los_mod_m', zeros(numel(obs.los_obs_m), 1), 'rmse_mm', NaN, ...
+                   'skip_reason', 'zero-variance epoch (e.g. reference date): not invertible'); %#ok<NASGU>
+        start_rmse_mm = nan(1, numel(seeds)); date_sec = toc(t0); %#ok<NASGU>
+        save(out_mat, 'R', 'start_rmse_mm', 'seeds', 'settings', 'date_sec', '-v7');
+        fprintf('  [%d/%d] %s: zero-variance LOS, recorded as not invertible\n', t, n_dates, stem);
+        continue
+    end
     best = []; start_rmse_mm = nan(1, numel(seeds));
     for s = 1:numel(seeds)
         R = iclassic_multi(in_mat, 'NSources', info.n_sources, 'FitOffset', logical(info.fit_offset), ...
@@ -68,4 +82,14 @@ for t = date_indices(:)'
     fprintf('  [%d/%d] %s: best seed %d, RMSE %.3f mm (%.1f s)\n', t, n_dates, stem, best.seed, best.rmse_mm, date_sec);
 end
 fprintf('[2/2] Done. Results in %s\n', res_dir);
+end
+
+function names = iclassic_param_count(model)
+% Parameter names of ONE source (same order as iclassic_multi.m), used to size a not-invertible record.
+switch lower(model)
+    case 'mogi';  names = {'xoff_m','yoff_m','depth_m','volume_m3'};
+    case 'sun69'; names = {'xoff_m','yoff_m','depth_m','radius_m','volume_m3'};
+    case 'okada'; names = {'xoff_m','yoff_m','depth_m','strike_deg','dip_deg','length_m','width_m','opening_m'};
+    otherwise; error('run_iclassic_perdate:badModel', 'Unknown model %s', model);
+end
 end

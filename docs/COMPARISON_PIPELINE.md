@@ -25,6 +25,7 @@ manifest.csv               ──►  vbICA  methods/vbica/{export.py, run_vbica
 | `iclassic_multi` (K=1, no offset) == `iclassic_insar` bit-for-bit; okadaMod/mogiMod == NumPy (centroid) | `methods/mcmc/gate_iclassic_multi.m` |
 | Same pixel set for every method (fingerprint in meta.json) | `compare.py` warning + smoke test |
 | Whole chain runs for all methods | `tests/integration/smoke_all_methods.sh` |
+| 3 methods x 7 scenarios (Mogi static/moving, Sun69, Okada, K=3, masked, real MintPy): 21/21 cells pass, same pixels, truth fits the exported data at the noise level | `scenarios/make_test_scenarios.py` + `tests/integration/submit_pipeline_matrix.sh` (PBS, one job per scenario) + `run_pipeline_matrix.py --aggregate` |
 
 ## Fixed rules (user decisions 2026-11-23)
 * Oracle K for every method in the main track; free per-date constant offset for every method
@@ -42,3 +43,7 @@ manifest.csv               ──►  vbICA  methods/vbica/{export.py, run_vbica
 4. vbICA: rule for N, IC-grouping rule (`overlap_cluster` is a candidate), its thresholds, convergence policy.
 5. Scoring thresholds (1.5 km / 50 % / 50 %, activity 2 x noise RMS, run success 80 %).
 6. Compute: vbICA and full MCMC runs need PBS (1 core here: vbICA > 28 min for 30 x 16384 at 6000 steps).
+7. Okada with 1 MCMC start / NBay 2000 stops in a worse basin than the truth (truth misfit = noise level): the
+   MCMC budget (starts, NBay) must be set per model -- part of item 3.
+8. vbICA N must not exceed the data rank (noise-free static sources are rank 1); the N rule must handle it.
+9. Real stacks: the reference date is an all-zero field -> recorded as 'not invertible' by MCMC (NaN params).

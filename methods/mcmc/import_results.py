@@ -24,7 +24,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from methods.contract import pixel_fingerprint, write_method_output  # noqa: E402
+from methods.contract import grid_axes_m, pixel_fingerprint, write_method_output  # noqa: E402
 from methods.mcmc.export import load_points  # noqa: E402
 from scenarios.manifest import DEFAULT_MANIFEST, load_manifest  # noqa: E402
 from scenarios.schema import PARAM_NAMES  # noqa: E402
@@ -101,7 +101,7 @@ def import_run(run_dir, row):
                 pixel_mask_sha1=pixel_fingerprint(stack.mask_d))
     print("[3/3] Writing contract outputs ...")
     write_method_output(run_dir, dates, [model] * n_sources, params, {track: to_grid(recon_pts_m)},
-                        stack.xE_grid[0, :] * 1e3, stack.yN_grid[:, 0] * 1e3, timing, meta,
+                        *grid_axes_m(stack.xE_grid, stack.yN_grid, stack.mask_d), timing, meta,
                         params_lo=bands['post_lo'], params_med=bands['post_med'], params_hi=bands['post_hi'],
                         band_pct=[2.5, 97.5], offset_m=offset_m, phys_by_track={track: to_grid(phys_pts_m)})
     return run_dir

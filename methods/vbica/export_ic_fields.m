@@ -30,6 +30,13 @@ ICA = R.ICA; options = R.options; Xd_precen = R.Xd_precen; clear R;
 if ~strcmp(ICA.decmode, 'S-mode'); error('export_ic_fields:notSmode', 'Expected S-mode, got %s', ICA.decmode); end
 if options.scen.N ~= n_comp; error('export_ic_fields:nMismatch', 'N=%d requested, file has %d', n_comp, options.scen.N); end
 N = options.scen.N;
+% vbICA silently reduces the PCA dimension when the data covariance is singular (e.g. a noise-free static source is
+% rank 1); N components cannot then be extracted. Fail with a clear message instead of an index error.
+n_ic_found = size(ICA.U, 2);
+if n_ic_found < N
+    error('export_ic_fields:rankBelowN', 'N exceeds data rank: vbICA kept only %d dimension(s) for N=%d; rerun with N <= %d', ...
+          n_ic_found, N, n_ic_found);
+end
 
 fprintf('[2/3] Rebuilding %d IC fields with calc_displ_lincomp ...\n', N);
 first = calc_displ_lincomp(ICA, options, 1, []);

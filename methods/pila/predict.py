@@ -30,7 +30,7 @@ sys.modules.setdefault('parse_config', _pila_parse_config)     # legacy checkpoi
 from pila.datasets.preprocessing.insar_mintpy import load_insar_mintpy  # noqa: E402
 from pila.utils.timing import PhaseTimer  # noqa: E402
 from plot_insar_results import build_model  # noqa: E402
-from methods.contract import pixel_fingerprint, write_method_output  # noqa: E402
+from methods.contract import grid_axes_m, pixel_fingerprint, write_method_output  # noqa: E402
 from scenarios.schema import PARAM_NAMES  # noqa: E402
 
 PHYSICS_MODEL = {'Mogi_LOS': 'mogi', 'MultiMogi_LOS': 'mogi', 'Sun69_LOS': 'sun69', 'Okada_LOS': 'okada'}
@@ -114,8 +114,7 @@ def predict(checkpoint, scenario_id, out_dir, label='best'):
 
     track = str(config['arch']['args']['insar']['geometry']).lower()
     track = track if track in ('asc', 'desc') else 'asc' if 'asc' in track.lower() else 'desc'
-    x_m = stack.xE_grid[0, :] * 1e3                                               # km -> m (local frame)
-    y_m = stack.yN_grid[:, 0] * 1e3
+    x_m, y_m = grid_axes_m(stack.xE_grid, stack.yN_grid, stack.mask_d)            # valid cells only (masked = 0)
     run_models_dir = os.path.dirname(os.path.abspath(checkpoint))
     if os.path.basename(run_models_dir) in ('lowest_loss', 'basin_best'):
         run_models_dir = os.path.dirname(run_models_dir)

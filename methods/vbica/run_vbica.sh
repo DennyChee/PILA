@@ -33,6 +33,11 @@ export ICA_SCENARIO="$SCEN_REL" ICA_CASE="$CASE/" ICA_N_COMPONENTS="$N_COMPONENT
     echo "  NOTE: vbICA driver exited non-zero (expected: plot_comp figure path); checking the decomposition file ..."
 WH_TAG=$([ "$WHITEN" = "1" ] && echo wh || echo nowh)
 DECOMP="$RUN_DIR/workdir/$SCEN_REL$CASE/matfiles_randinit_N${NN}_${WH_TAG}/decomposedICA_data_randinit_N${NN}_${WH_TAG}.mat"
+RANK=$(grep -oE "Dimension reduced to [0-9]+" "$LOG" | tail -1 | grep -oE "[0-9]+$" || true)
+if [ -n "$RANK" ] && [ "$RANK" -lt "$N_COMPONENTS" ]; then
+    echo "ERROR: N exceeds data rank: vbICA kept only $RANK dimension(s) for N=$N_COMPONENTS; rerun with N <= $RANK"
+    exit 2
+fi
 if [ ! -f "$DECOMP" ] || ! grep -q "driver total" "$LOG"; then
     echo "ERROR: vbICA decomposition missing ($DECOMP); see $LOG"
     exit 1
